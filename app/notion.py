@@ -66,13 +66,26 @@ def build_properties(*, draft: str, source: str | None = None, status: str | Non
     return props
 
 
-async def create_row(database_id: str, properties: dict) -> dict:
-    """POST /v1/pages — новий рядок у таблиці."""
+def _paragraphs(text: str) -> list:
+    """Тіло сторінки: один paragraph-блок на абзац (кожен ≤ 2000 символів)."""
+    return [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": _rich(par)}}
+            for par in text.split("\n\n") if par.strip()]
+
+
+async def create_row(database_id: str, properties: dict, body: str | None = None) -> dict:
+    """POST /v1/pages — новий рядок у таблиці; body (якщо є) стає контентом сторінки рядка."""
+    payload: dict = {"parent": {"database_id": database_id}, "properties": properties}
+    if body:
+        payload["children"] = _paragraphs(body)
     async with httpx.AsyncClient(timeout=30) as client:
-        return _check(await client.post(
-            f"{NOTION_API}/pages", headers=_headers(),
-            json={"parent": {"database_id": database_id}, "properties": properties},
-        ))
+        return _check(await client.post(f"{NOTION_API}/pages", headers=_headers(), json=payload))
+
+
+async def append_body(page_id: str, body: str) -> dict:
+    """PATCH /v1/blocks/{id}/children — дописати текст у контент існуючого рядка."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        return _check(await client.patch(f"{NOTION_API}/blocks/{page_id}/children", headers=_headers(),
+                                         json={"children": _paragraphs(body)}))
 
 
 async def update_row(page_id: str, properties: dict) -> dict:

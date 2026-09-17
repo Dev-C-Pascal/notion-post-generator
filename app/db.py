@@ -94,6 +94,11 @@ def log_post(notion_page_id: str, article_id: int, topic: str | None, post_text:
         return cur.lastrowid
 
 
+def count_posts() -> int:
+    with _connect(POSTS_DB) as c:
+        return c.execute("SELECT COUNT(*) FROM posts WHERE status = 'ok'").fetchone()[0]
+
+
 def list_posts(limit: int = 50) -> list[dict]:
     with _connect(POSTS_DB) as c:
         rows = c.execute("SELECT * FROM posts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()

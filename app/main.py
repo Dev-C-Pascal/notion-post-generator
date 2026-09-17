@@ -83,16 +83,18 @@ async def process(page_id: str) -> None:
 
         article = llm.select_article(topic)
         post_text = llm.write_post(article, topic)
+        headline = llm.write_headline(article, topic, n=db.count_posts() + 1)
         props = notion.build_properties(
-            draft=post_text,
+            draft=headline,
             source=f"{article['title']} — {article['url']}",
             status="Done",
             score=llm.score_article(article, topic),
         )
         if target_row:
             row = await notion.update_row(target_row, props)
+            await notion.append_body(target_row, post_text)
         else:
-            row = await notion.create_row(DATABASE_ID, props)
+            row = await notion.create_row(DATABASE_ID, props, body=post_text)
         db.log_post(row["id"], article["id"], topic, post_text, llm.MODEL_NAME)
         log.info("OK row=%s article=%s", row["id"], article["id"])
     except Exception as e:

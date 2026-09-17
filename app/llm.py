@@ -24,10 +24,18 @@ def select_article(topic: str | None) -> db.sqlite3.Row:
     return random.choice(articles)
 
 
+def write_headline(article: db.sqlite3.Row, topic: str | None, n: int) -> str:
+    """Крок 2a: короткий заголовок (кілька слів) — іде в Draft. Заглушка: «Новина N: Україна <тема>»."""
+    word = (topic or article["topic"] or "новини").capitalize()
+    return f"Новина {n}: Україна {word}"
+
+
 def write_post(article: db.sqlite3.Row, topic: str | None) -> str:
-    """Крок 2: LLM пише пост на основі статті. Заглушка повертає шаблонний текст."""
+    """Крок 2b: LLM пише повний пост на основі статті — іде всередину сторінки рядка."""
+    from datetime import datetime
+    stamp = datetime.now().strftime("%H:%M:%S")
     return (
-        f"[ЗАГЛУШКА {MODEL_NAME}] Пост на тему «{topic or 'без теми'}»\n\n"
+        f"[ЗАГЛУШКА {MODEL_NAME} · {stamp}] Пост на тему «{topic or 'без теми'}»\n\n"
         f"{article['body']}\n\n"
         f"Джерело: {article['title']} ({article['source']})\n"
         f"#KSE #AI"
