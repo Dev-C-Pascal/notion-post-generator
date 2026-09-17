@@ -7,4 +7,9 @@ jobs:
   trigger:
     runs-on: ubuntu-latest
     steps:
-      - run: curl -fsS -X POST "${{ secrets.RUN_URL }}/run" -H "x-webhook-secret: ${{ secrets.WEBHOOK_SECRET }}"
+      - name: POST /run
+        env:
+          RUN_URL: ${{ secrets.RUN_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: |
+          curl -fsS -X POST "$RUN_URL/run" -H "x-webhook-secret: $WEBHOOK_SECRET"
