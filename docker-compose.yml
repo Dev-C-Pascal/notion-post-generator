@@ -2,6 +2,7 @@
 services:
   app:
     build: .
+    image: post-generator:${IMAGE_TAG:-local}
     restart: unless-stopped
     env_file: .env
     volumes:

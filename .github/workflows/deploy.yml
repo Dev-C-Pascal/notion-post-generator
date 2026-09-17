@@ -1,13 +1,19 @@
-name: Deploy to AWS
+name: Deploy
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      environment:
+        description: "staging або prod"
+        default: staging
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # staging за замовчуванням; prod — вручну через workflow_dispatch. Секрети окремі на кожен environment.
+    environment: ${{ github.event.inputs.environment || 'staging' }}
     steps:
-      - name: Pull & restart on EC2 over SSH
+      - name: Deploy image tagged with git sha, smoke-test, rollback on failure
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -16,6 +22,14 @@ jobs:
           script: |
             set -e
             cd ~/post-generator
-            git pull --ff-only
+            PREV=$(git rev-parse HEAD)
+            git fetch -q && git checkout -q ${{ github.sha }}
+            export IMAGE_TAG=${{ github.sha }}
             docker compose up -d --build
+            sleep 5
+            if ! curl -fsS localhost:8000/health && ! curl -fsSk https://localhost/health; then
+              echo "smoke failed → rollback to $PREV"
+              git checkout -q $PREV && IMAGE_TAG=$PREV docker compose up -d --build
+              exit 1
+            fi
             docker compose ps

@@ -1,49 +1,65 @@
-"""Заглушка LLM. Інтерфейс зафіксований — коли інший департамент дасть модель,
-замінюється тільки тіло цих двох функцій (або клас-адаптер), решта системи не змінюється.
+"""ModelClient — інтерфейс до моделі. StubModelClient для тестів/прототипу;
+реальний інференс (інший департамент) реалізує той самий інтерфейс.
 """
-import random
+from __future__ import annotations
 
-from . import db
+from typing import Protocol
 
-MODEL_NAME = "stub-v0"
+from .models import Article, Draft, Evaluation, Extraction, RelevanceResult
 
-
-def select_article(topic: str | None) -> db.sqlite3.Row:
-    """Крок 1: LLM обирає статтю, яка підходить під тему.
-    Заглушка: якщо тема збігається з полем topic статті — беремо її, інакше випадкову.
-    """
-    articles = db.list_articles()
-    if not articles:
-        raise RuntimeError("База статей порожня")
-    if topic:
-        t = topic.lower()
-        matches = [a for a in articles
-                   if a["topic"] and (a["topic"].lower() in t or t in a["topic"].lower())]
-        if matches:
-            return matches[0]
-    return random.choice(articles)
+STUB_VERSION = "stub-v0"
 
 
-def write_headline(article: db.sqlite3.Row, topic: str | None, n: int) -> str:
-    """Крок 2a: короткий заголовок (кілька слів) — іде в Draft. Заглушка: «Новина N: Україна <тема>»."""
-    word = (topic or article["topic"] or "новини").capitalize()
-    return f"Новина {n}: Україна {word}"
+class ModelClient(Protocol):
+    version: str
+
+    def relevance(self, article: Article, topic: str | None) -> RelevanceResult: ...
+    def extraction(self, article: Article) -> Extraction: ...
+    def draft(self, article: Article, extraction: Extraction, n: int) -> Draft: ...
+    def evaluate(self, draft: Draft) -> Evaluation: ...
 
 
-def write_post(article: db.sqlite3.Row, topic: str | None) -> str:
-    """Крок 2b: LLM пише повний пост на основі статті — іде всередину сторінки рядка."""
-    from datetime import datetime
-    stamp = datetime.now().strftime("%H:%M:%S")
-    return (
-        f"[ЗАГЛУШКА {MODEL_NAME} · {stamp}] Пост на тему «{topic or 'без теми'}»\n\n"
-        f"{article['body']}\n\n"
-        f"Джерело: {article['title']} ({article['source']})\n"
-        f"#KSE #AI"
-    )
+class StubModelClient:
+    """Заглушка: детермінована, без мережі."""
+
+    version = STUB_VERSION
+
+    def relevance(self, article: Article, topic: str | None) -> RelevanceResult:
+        if topic and article.topic and (article.topic.lower() in topic.lower() or topic.lower() in article.topic.lower()):
+            return RelevanceResult(article_id=article.id, relevant=True, score=0.9,
+                                   reason=f"тема статті «{article.topic}» збігається із запитом «{topic}»")
+        relevant = len(article.text) > 40
+        return RelevanceResult(article_id=article.id, relevant=relevant, score=0.6 if relevant else 0.2,
+                               reason="стаття достатньо змістовна (stub)" if relevant else "занадто коротка (stub)")
+
+    def extraction(self, article: Article) -> Extraction:
+        sentences = [s.strip() for s in article.text.replace("\n", " ").split(".") if s.strip()]
+        return Extraction(
+            article_id=article.id,
+            main_claim=sentences[0] if sentences else article.title,
+            facts=sentences[1:3],
+            examples=[],
+            angle=f"погляд Тимофія на тему «{article.topic or 'новини'}» (stub)",
+        )
+
+    def draft(self, article: Article, extraction: Extraction, n: int) -> Draft:
+        from datetime import datetime
+        word = (article.topic or "новини").capitalize()
+        stamp = datetime.now().strftime("%H:%M:%S")
+        text = (
+            f"[ЗАГЛУШКА {self.version} · {stamp}]\n\n"
+            f"{extraction.main_claim}.\n\n"
+            + ("\n".join(f"— {f}." for f in extraction.facts) + "\n\n" if extraction.facts else "")
+            + f"Джерело: {article.title} ({article.source})\n#KSE #AI"
+        )
+        return Draft(article_id=article.id, headline=f"Новина {n}: Україна {word}", text=text, model_version=self.version)
+
+    def evaluate(self, draft: Draft) -> Evaluation:
+        if len(draft.text) < 80:
+            return Evaluation(article_id=draft.article_id, quality_score=0.3, failure_type="too_short")
+        return Evaluation(article_id=draft.article_id, quality_score=0.7)
 
 
-def score_article(article: db.sqlite3.Row, topic: str | None) -> float:
-    """Крок 1b: оцінка релевантності статті (0..1). Заглушка: 0.9 якщо тема збіглася, інакше 0.5."""
-    if topic and article["topic"] and article["topic"].lower() in topic.lower():
-        return 0.9
-    return 0.5
+def get_model_client() -> ModelClient:
+    """Точка заміни: тут інший департамент підставить реальний клієнт (за env MODEL_BACKEND)."""
+    return StubModelClient()

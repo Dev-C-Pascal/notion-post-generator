@@ -1,4 +1,6 @@
 -r requirements.txt
 pytest
+pytest-asyncio
 httpx
 ruff
+mypy

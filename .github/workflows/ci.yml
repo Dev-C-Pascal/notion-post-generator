@@ -11,5 +11,6 @@ jobs:
         with: { python-version: "3.13" }
       - run: pip install -r requirements-dev.txt
       - run: ruff check app tests
+      - run: mypy app
       - run: pytest -q
-      - run: docker build -t post-generator .
+      - run: docker build -t post-generator:${{ github.sha }} .
