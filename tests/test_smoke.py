@@ -29,14 +29,21 @@ def test_model_steps():
 
 
 @pytest.mark.asyncio
-async def test_e2e_with_mock_notion(monkeypatch):
+async def test_e2e_with_mock_notion(monkeypatch, tmp_path):
+    # ізольовані БД, щоб не чіпати data/*.db
+    monkeypatch.setattr(db, "ARTICLES_DB", tmp_path / "articles.db")
+    monkeypatch.setattr(db, "RUNS_DB", tmp_path / "runs.db")
     created = []
 
     async def fake_create(database_id, properties, body=None):
         created.append(properties)
         return {"id": f"page-{len(created)}"}
 
+    async def fake_update(page_id, properties):
+        return {"id": page_id}
+
     monkeypatch.setattr(notion, "create_row", fake_create)
+    monkeypatch.setattr(notion, "update_row", fake_update)
     db.init_db()
     summary = await pipeline.run_pipeline("testrun", database_id="db", limit=1)
     assert summary.status == "ok" and summary.drafts_written == 1
