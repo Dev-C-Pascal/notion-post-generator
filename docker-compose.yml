@@ -7,8 +7,9 @@ services:
     env_file: .env
     volumes:
       - ./data:/srv/data
-    expose:
-      - "8000"
+    # тільки loopback: назовні ходимо через Caddy, а smoke-тест у deploy.yml б'є в 127.0.0.1:8000
+    ports:
+      - "127.0.0.1:8000:8000"
 
   caddy:
     image: caddy:2

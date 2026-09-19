@@ -27,7 +27,7 @@ jobs:
             export IMAGE_TAG=${{ github.sha }}
             docker compose up -d --build
             sleep 5
-            if ! curl -fsS localhost:8000/health && ! curl -fsSk https://localhost/health; then
+            if ! curl -fsS --retry 5 --retry-delay 3 --retry-all-errors http://127.0.0.1:8000/health; then
               echo "smoke failed → rollback to $PREV"
               git checkout -q $PREV && IMAGE_TAG=$PREV docker compose up -d --build
               exit 1
