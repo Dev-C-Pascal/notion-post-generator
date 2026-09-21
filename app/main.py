@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import db, notion, pipeline
+from . import db, notion, pg, pipeline
 from .llm import get_model_client
 
 load_dotenv()
@@ -29,6 +29,9 @@ app = FastAPI(title="Post generator (MLOps prototype)")
 @app.on_event("startup")
 def _startup() -> None:
     db.init_db()
+    if pg.enabled():
+        pg.init_db()
+        log.info("drafts Postgres ready")
     log.info("DBs ready: %s, %s; target Notion DB=%s", db.ARTICLES_DB, db.RUNS_DB, DATABASE_ID)
 
 

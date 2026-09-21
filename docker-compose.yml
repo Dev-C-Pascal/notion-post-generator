@@ -1,15 +1,39 @@
-# Продакшен на одному EC2: app (FastAPI) + caddy (HTTPS, потрібен Notion для вебхука).
+# Продакшен на одному EC2: app (FastAPI) + db (Postgres драфтів) + caddy (HTTPS, потрібен Notion для вебхука).
 services:
   app:
     build: .
     image: post-generator:${IMAGE_TAG:-local}
     restart: unless-stopped
     env_file: .env
+    environment:
+      - DRAFTS_DATABASE_URL=postgresql://postgen:${POSTGEN_DB_PASSWORD:?set POSTGEN_DB_PASSWORD in .env}@db:5432/postgen
     volumes:
       - ./data:/srv/data
     # тільки loopback: назовні ходимо через Caddy, а smoke-тест у deploy.yml б'є в 127.0.0.1:8000
     ports:
       - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Окрема база драфтів. 5432 на хості зайнятий базою Андрія (/opt/comms), тому назовні — 127.0.0.1:5433.
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=postgen
+      - POSTGRES_USER=postgen
+      - POSTGRES_PASSWORD=${POSTGEN_DB_PASSWORD:?set POSTGEN_DB_PASSWORD in .env}
+    command: postgres -c shared_buffers=64MB -c max_connections=20
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgen -d postgen"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   caddy:
     image: caddy:2
@@ -27,3 +51,4 @@ services:
 
 volumes:
   caddy_data:
+  pgdata:

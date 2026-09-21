@@ -8,7 +8,7 @@ os.environ["NOTION_DATABASE_ID"] = "0" * 32
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app import db, notion, pipeline  # noqa: E402
+from app import db, notion, pg, pipeline  # noqa: E402
 from app.llm import StubModelClient  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Article  # noqa: E402
@@ -44,10 +44,14 @@ async def test_e2e_with_mock_notion(monkeypatch, tmp_path):
 
     monkeypatch.setattr(notion, "create_row", fake_create)
     monkeypatch.setattr(notion, "update_row", fake_update)
+    saved = []
+    monkeypatch.setattr(pg, "enabled", lambda: True)
+    monkeypatch.setattr(pg, "save_draft", lambda run_id, r: saved.append((run_id, r.notion_page_id)))
     db.init_db()
     summary = await pipeline.run_pipeline("testrun", database_id="db", limit=1)
     assert summary.status == "ok" and summary.drafts_written == 1
     assert created[0]["Draft"]["title"][0]["text"]["content"].startswith("Новина")
+    assert saved == [("testrun", "page-1")]  # драфт додатково пішов у Postgres
     # upsert: повторний прогін з тим самим run_id не створює новий рядок
     await pipeline.run_pipeline("testrun", database_id="db", limit=1)
     assert len(created) == 1

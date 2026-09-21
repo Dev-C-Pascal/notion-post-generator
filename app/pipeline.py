@@ -8,7 +8,7 @@ import logging
 import time
 import uuid
 
-from . import db, notion
+from . import db, notion, pg
 from .llm import ModelClient, get_model_client
 from .models import Article, DraftResult, RunSummary
 
@@ -72,6 +72,8 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, topic: 
                 res.draft = model.draft(a, res.extraction, n=db.count_drafts() + 1)
                 res.evaluation = model.evaluate(res.draft)
                 res.notion_page_id = await step_write_notion(run_id, database_id, res)
+                if pg.enabled():
+                    pg.save_draft(run_id, res)
                 written += 1
                 if a.id:
                     db.mark_processed(a.id)
