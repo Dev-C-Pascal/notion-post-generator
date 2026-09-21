@@ -10,6 +10,7 @@ import httpx
 NOTION_API = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 TEXT_LIMIT = 2000  # ліміт Notion на один текстовий фрагмент у title/rich_text
+BLOCKS_LIMIT = 100  # ліміт Notion на кількість блоків в одному запиті
 
 
 def _headers() -> dict:
@@ -75,10 +76,15 @@ def _paragraphs(text: str) -> list:
 async def create_row(database_id: str, properties: dict, body: str | None = None) -> dict:
     """POST /v1/pages — новий рядок у таблиці; body (якщо є) стає контентом сторінки рядка."""
     payload: dict = {"parent": {"database_id": database_id}, "properties": properties}
-    if body:
-        payload["children"] = _paragraphs(body)
+    blocks = _paragraphs(body) if body else []
+    if blocks:
+        payload["children"] = blocks[:BLOCKS_LIMIT]
     async with httpx.AsyncClient(timeout=30) as client:
-        return _check(await client.post(f"{NOTION_API}/pages", headers=_headers(), json=payload))
+        page = _check(await client.post(f"{NOTION_API}/pages", headers=_headers(), json=payload))
+        for i in range(BLOCKS_LIMIT, len(blocks), BLOCKS_LIMIT):
+            _check(await client.patch(f"{NOTION_API}/blocks/{page['id']}/children", headers=_headers(),
+                                      json={"children": blocks[i:i + BLOCKS_LIMIT]}))
+    return page
 
 
 async def append_body(page_id: str, body: str) -> dict:

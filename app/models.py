@@ -3,7 +3,7 @@ from pydantic import BaseModel
 
 
 class Article(BaseModel):
-    id: int
+    id: int | str  # int — SQLite articles.db, str (uuid) — comms.core.article
     url: str
     title: str
     text: str
@@ -14,14 +14,14 @@ class Article(BaseModel):
 
 
 class RelevanceResult(BaseModel):
-    article_id: int
+    article_id: int | str
     relevant: bool
     reason: str
     score: float  # 0..1
 
 
 class Extraction(BaseModel):
-    article_id: int
+    article_id: int | str
     main_claim: str
     facts: list[str]
     examples: list[str]
@@ -29,14 +29,14 @@ class Extraction(BaseModel):
 
 
 class Draft(BaseModel):
-    article_id: int
+    article_id: int | str
     headline: str
     text: str
     model_version: str
 
 
 class Evaluation(BaseModel):
-    article_id: int
+    article_id: int | str
     quality_score: float  # 0..1
     failure_type: str | None = None  # None = ok; інакше: too_short | off_topic | hallucination | ...
 

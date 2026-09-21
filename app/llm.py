@@ -43,16 +43,8 @@ class StubModelClient:
         )
 
     def draft(self, article: Article, extraction: Extraction, n: int) -> Draft:
-        from datetime import datetime
-        word = (article.topic or "новини").capitalize()
-        stamp = datetime.now().strftime("%H:%M:%S")
-        text = (
-            f"[ЗАГЛУШКА {self.version} · {stamp}]\n\n"
-            f"{extraction.main_claim}.\n\n"
-            + ("\n".join(f"— {f}." for f in extraction.facts) + "\n\n" if extraction.facts else "")
-            + f"Джерело: {article.title} ({article.source})\n#KSE #AI"
-        )
-        return Draft(article_id=article.id, headline=f"Новина {n}: Україна {word}", text=text, model_version=self.version)
+        # Поки нема моделі: «пост» = сама стаття без змін (заголовок + повний текст).
+        return Draft(article_id=article.id, headline=article.title, text=article.text, model_version=self.version)
 
     def evaluate(self, draft: Draft) -> Evaluation:
         if len(draft.text) < 80:

@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE TABLE IF NOT EXISTS drafts (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id         TEXT NOT NULL REFERENCES runs(run_id),
-    article_id     INTEGER NOT NULL,          -- FK -> articles.id (в іншій БД)
+    article_id     INTEGER NOT NULL,          -- articles.id (SQLite) або uuid із comms.core.article
     notion_page_id TEXT,
     relevance      INTEGER NOT NULL,          -- 0/1
     reason         TEXT,
@@ -136,13 +136,13 @@ def count_drafts() -> int:
 
 # ---------- drafts (upsert по article_id + run_id) ----------
 
-def find_draft_page(article_id: int, run_id: str) -> str | None:
+def find_draft_page(article_id: int | str, run_id: str) -> str | None:
     with _connect(RUNS_DB) as c:
         r = c.execute("SELECT notion_page_id FROM drafts WHERE article_id=? AND run_id=?", (article_id, run_id)).fetchone()
     return r["notion_page_id"] if r else None
 
 
-def upsert_draft(*, run_id: str, article_id: int, notion_page_id: str | None, relevance: bool, reason: str,
+def upsert_draft(*, run_id: str, article_id: int | str, notion_page_id: str | None, relevance: bool, reason: str,
                  score: float | None, extraction: str | None, headline: str | None, draft_text: str | None,
                  failure_type: str | None, model_version: str) -> None:
     with _connect(RUNS_DB) as c:

@@ -1,4 +1,4 @@
-# Продакшен на одному EC2: app (FastAPI) + db (Postgres драфтів) + caddy (HTTPS, потрібен Notion для вебхука).
+# Продакшен на одному EC2: app (FastAPI, статті з бази Андрія) + db (Postgres драфтів) + caddy (HTTPS, потрібен Notion для вебхука).
 services:
   app:
     build: .
@@ -6,7 +6,7 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      - DRAFTS_DATABASE_URL=postgresql://postgen:${POSTGEN_DB_PASSWORD:?set POSTGEN_DB_PASSWORD in .env}@db:5432/postgen
+      - DRAFTS_DATABASE_URL=postgresql://postgen:${POSTGEN_DB_PASSWORD:?set POSTGEN_DB_PASSWORD in .env}@postgen-db:5432/postgen
     volumes:
       - ./data:/srv/data
     # тільки loopback: назовні ходимо через Caddy, а smoke-тест у deploy.yml б'є в 127.0.0.1:8000
@@ -15,6 +15,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # comms — мережа стеку Андрія (/opt/comms/deploy): звідти читаємо статті, хост deploy-db-1
+    networks: [default, comms]
 
   # Окрема база драфтів. 5432 на хості зайнятий базою Андрія (/opt/comms), тому назовні — 127.0.0.1:5433.
   db:
@@ -25,6 +27,10 @@ services:
       - POSTGRES_USER=postgen
       - POSTGRES_PASSWORD=${POSTGEN_DB_PASSWORD:?set POSTGEN_DB_PASSWORD in .env}
     command: postgres -c shared_buffers=64MB -c max_connections=20
+    # унікальне імʼя: app сидить і в мережі Андрія, де теж є сервіс `db`
+    networks:
+      default:
+        aliases: [postgen-db]
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
@@ -52,3 +58,8 @@ services:
 volumes:
   caddy_data:
   pgdata:
+
+networks:
+  comms:
+    external: true
+    name: deploy_default

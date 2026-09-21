@@ -8,7 +8,7 @@ import logging
 import time
 import uuid
 
-from . import db, notion, pg
+from . import comms, db, notion, pg
 from .llm import ModelClient, get_model_client
 from .models import Article, DraftResult, RunSummary
 
@@ -27,6 +27,9 @@ def new_run_id() -> str:
 
 
 def step_fetch(limit: int) -> list[Article]:
+    if comms.enabled():
+        latest = comms.fetch_latest_article()
+        return [latest] if latest else [PLACEHOLDER]
     articles = db.fetch_articles(limit=limit)
     return articles or [PLACEHOLDER]
 
@@ -75,7 +78,7 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, topic: 
                 if pg.enabled():
                     pg.save_draft(run_id, res)
                 written += 1
-                if a.id:
+                if isinstance(a.id, int) and a.id:
                     db.mark_processed(a.id)
             db.upsert_draft(
                 run_id=run_id, article_id=a.id, notion_page_id=res.notion_page_id,

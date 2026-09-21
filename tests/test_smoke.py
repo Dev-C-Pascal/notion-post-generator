@@ -8,7 +8,7 @@ os.environ["NOTION_DATABASE_ID"] = "0" * 32
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app import db, notion, pg, pipeline  # noqa: E402
+from app import comms, db, notion, pg, pipeline  # noqa: E402
 from app.llm import StubModelClient  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Article  # noqa: E402
@@ -24,8 +24,8 @@ def test_model_steps():
     ex = m.extraction(ART)
     assert ex.main_claim == "Перше речення"
     d = m.draft(ART, ex, n=7)
-    assert d.headline.startswith("Новина 7")
-    assert m.evaluate(d).failure_type is None
+    assert (d.headline, d.text) == (ART.title, ART.text)  # поки без моделі: пост = стаття
+    assert m.evaluate(d).failure_type == "too_short"  # ART коротша за 80 символів
 
 
 @pytest.mark.asyncio
@@ -50,11 +50,20 @@ async def test_e2e_with_mock_notion(monkeypatch, tmp_path):
     db.init_db()
     summary = await pipeline.run_pipeline("testrun", database_id="db", limit=1)
     assert summary.status == "ok" and summary.drafts_written == 1
-    assert created[0]["Draft"]["title"][0]["text"]["content"].startswith("Новина")
+    assert created[0]["Draft"]["title"][0]["text"]["content"] == pipeline.PLACEHOLDER.title
     assert saved == [("testrun", "page-1")]  # драфт додатково пішов у Postgres
     # upsert: повторний прогін з тим самим run_id не створює новий рядок
     await pipeline.run_pipeline("testrun", database_id="db", limit=1)
     assert len(created) == 1
+
+
+def test_fetch_takes_latest_from_comms(monkeypatch):
+    latest = ART.model_copy(update={"id": "0b7c-uuid"})
+    monkeypatch.setattr(comms, "enabled", lambda: True)
+    monkeypatch.setattr(comms, "fetch_latest_article", lambda: latest)
+    assert pipeline.step_fetch(limit=5) == [latest]
+    monkeypatch.setattr(comms, "fetch_latest_article", lambda: None)
+    assert pipeline.step_fetch(limit=5) == [pipeline.PLACEHOLDER]
 
 
 def test_api():
