@@ -34,18 +34,21 @@ def step_fetch(limit: int) -> list[Article]:
     return articles or [PLACEHOLDER]
 
 
+def notion_status(r: DraftResult) -> str:
+    assert r.evaluation
+    return "Done" if not r.evaluation.failure_type else "In progress"
+
+
 async def step_write_notion(run_id: str, database_id: str, r: DraftResult) -> str:
     """Upsert у Notion: якщо для (article_id, run_id) рядок уже є — оновлюємо, інакше створюємо."""
     assert r.draft and r.evaluation
     props = notion.build_properties(
         draft=r.draft.headline,
         source=f"{r.article.title} — {r.article.url}",
-        status="Done" if not r.evaluation.failure_type else "In progress",
-        score=r.evaluation.quality_score,
+        status=notion_status(r),
     )
     body = (
-        f"run_id: {run_id} · model: {r.draft.model_version} · relevance: {r.relevance.score:.2f} ({r.relevance.reason})"
-        f" · failure_type: {r.evaluation.failure_type or 'none'}\n\n"
+        f"run_id: {run_id} · model: {r.draft.model_version}\n\n"
         f"{r.draft.text}"
     )
     existing = db.find_draft_page(r.article.id, run_id)
@@ -76,7 +79,7 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, topic: 
                 res.evaluation = model.evaluate(res.draft)
                 res.notion_page_id = await step_write_notion(run_id, database_id, res)
                 if pg.enabled():
-                    pg.save_draft(run_id, res)
+                    pg.save_draft(run_id, res, notion_status(res))
                 written += 1
                 if isinstance(a.id, int) and a.id:
                     db.mark_processed(a.id)

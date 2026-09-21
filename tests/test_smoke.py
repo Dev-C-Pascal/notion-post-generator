@@ -46,7 +46,7 @@ async def test_e2e_with_mock_notion(monkeypatch, tmp_path):
     monkeypatch.setattr(notion, "update_row", fake_update)
     saved = []
     monkeypatch.setattr(pg, "enabled", lambda: True)
-    monkeypatch.setattr(pg, "save_draft", lambda run_id, r: saved.append((run_id, r.notion_page_id)))
+    monkeypatch.setattr(pg, "save_draft", lambda run_id, r, status: saved.append((run_id, r.notion_page_id)))
     db.init_db()
     summary = await pipeline.run_pipeline("testrun", database_id="db", limit=1)
     assert summary.status == "ok" and summary.drafts_written == 1

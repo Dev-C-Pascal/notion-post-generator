@@ -54,16 +54,14 @@ def extract_text(page: dict, prop_name: str) -> str | None:
     return "".join(p.get("plain_text", "") for p in parts) or None
 
 
-def build_properties(*, draft: str, source: str | None = None, status: str | None = None,
-                     score: float | None = None) -> dict:
-    """Властивості під схему таблиці MVP: Draft(title), Source(text), Status(select), Score(number)."""
+def build_properties(*, draft: str, source: str | None = None, status: str | None = None) -> dict:
+    """Властивості під схему таблиці MVP: Draft(title), Source(text), Status(select).
+    Score бекенд не пише: оцінку ставить окрема система разом з людиною."""
     props: dict = {os.environ.get("NOTION_PROP_DRAFT", "Draft"): {"title": _rich(draft)}}
     if source is not None:
         props[os.environ.get("NOTION_PROP_SOURCE", "Source")] = {"rich_text": _rich(source)}
     if status is not None:
         props[os.environ.get("NOTION_PROP_STATUS", "Status")] = {"select": {"name": status}}
-    if score is not None:
-        props[os.environ.get("NOTION_PROP_SCORE", "Score")] = {"number": score}
     return props
 
 
@@ -106,3 +104,41 @@ async def get_database(database_id: str) -> dict:
     """GET /v1/databases/{id} — схема таблиці (для діагностики)."""
     async with httpx.AsyncClient(timeout=30) as client:
         return _check(await client.get(f"{NOTION_API}/databases/{database_id}", headers=_headers()))
+
+
+async def query_edited_since(database_id: str, since: str) -> list[dict]:
+    """POST /v1/databases/{id}/query — рядки, змінені з `since` (ISO), від старих до нових; усі сторінки курсора."""
+    body: dict = {
+        "filter": {"timestamp": "last_edited_time", "last_edited_time": {"on_or_after": since}},
+        "sorts": [{"timestamp": "last_edited_time", "direction": "ascending"}],
+        "page_size": 100,
+    }
+    pages: list[dict] = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            r = _check(await client.post(f"{NOTION_API}/databases/{database_id}/query", headers=_headers(), json=body))
+            pages += r["results"]
+            if not r.get("has_more"):
+                return pages
+            body["start_cursor"] = r["next_cursor"]
+
+
+async def read_body(page_id: str) -> list[str]:
+    """Текст сторінки: по рядку на блок верхнього рівня (paragraph, heading, list item, quote…)."""
+    blocks: list[str] = []
+    params: dict = {"page_size": 100}
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            r = _check(await client.get(f"{NOTION_API}/blocks/{page_id}/children", headers=_headers(), params=params))
+            for b in r["results"]:
+                rich = (b.get(b.get("type", "")) or {}).get("rich_text")
+                if rich is not None:
+                    blocks.append("".join(t.get("plain_text", "") for t in rich))
+            if not r.get("has_more"):
+                return blocks
+            params["start_cursor"] = r["next_cursor"]
+
+
+def select_value(page: dict, prop_name: str) -> str | None:
+    sel = (page.get("properties", {}).get(prop_name) or {}).get("select")
+    return sel.get("name") if sel else None
