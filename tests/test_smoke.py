@@ -4,12 +4,16 @@ import os
 os.environ["NOTION_TOKEN"] = "secret_xxx"
 os.environ["WEBHOOK_SECRET"] = "t"
 os.environ["NOTION_DATABASE_ID"] = "0" * 32
+os.environ["RUNPOD_API_KEY"] = ""  # не ходити в справжній RunPod, навіть якщо ключ є в локальному .env
 
+import json  # noqa: E402
+
+import httpx  # noqa: E402
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app import comms, db, notion, pg, pipeline  # noqa: E402
-from app.llm import StubModelClient  # noqa: E402
+from app.llm import ModelError, RunPodModelClient, StubModelClient, detect_lang, get_model_client  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Article  # noqa: E402
 
@@ -26,6 +30,39 @@ def test_model_steps():
     d = m.draft(ART, ex, n=7)
     assert (d.headline, d.text) == (ART.title, ART.text)  # поки без моделі: пост = стаття
     assert m.evaluate(d).failure_type == "too_short"  # ART коротша за 80 символів
+
+
+def _runpod(responses: list[dict], sent: list) -> RunPodModelClient:
+    """RunPod-клієнт, що замість мережі віддає відповіді по черзі."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((request.method, request.url.path, json.loads(request.content) if request.content else None))
+        return httpx.Response(200, json=responses.pop(0))
+    return RunPodModelClient("ep1", "key", poll_s=0, transport=httpx.MockTransport(handler))
+
+
+def test_runpod_draft_waits_for_cold_start():
+    sent: list = []
+    m = _runpod([{"id": "j1", "status": "IN_QUEUE"}, {"id": "j1", "status": "IN_PROGRESS"},
+                 {"id": "j1", "status": "COMPLETED", "output": {"post": " Пост 1/\n\nПост 2/ "}}], sent)
+    d = m.draft(ART, StubModelClient().extraction(ART), n=1)
+    assert (d.headline, d.text, d.model_version) == (ART.title, "Пост 1/\n\nПост 2/", "runpod-ep1")
+    assert sent[0] == ("POST", "/v2/ep1/runsync", {"input": {"article_text": ART.text, "lang": "uk"}})
+    assert [s[1] for s in sent[1:]] == ["/v2/ep1/status/j1"] * 2
+
+
+def test_runpod_failed_job_raises():
+    m = _runpod([{"id": "j2", "status": "FAILED", "error": "CUDA OOM"}], [])
+    with pytest.raises(ModelError, match="CUDA OOM"):
+        m.draft(ART, StubModelClient().extraction(ART), n=1)
+
+
+def test_model_client_choice(monkeypatch):
+    monkeypatch.delenv("RUNPOD_ENDPOINT_ID", raising=False)
+    assert get_model_client().version == "stub-v0"
+    monkeypatch.setenv("RUNPOD_ENDPOINT_ID", "ep1")
+    monkeypatch.setenv("RUNPOD_API_KEY", "key")
+    assert get_model_client().version == "runpod-ep1"
+    assert (detect_lang("Нацбанк зберіг ставку"), detect_lang("NBU kept the rate")) == ("uk", "en")
 
 
 @pytest.mark.asyncio
