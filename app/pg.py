@@ -4,6 +4,7 @@
 Кожен драфт, що пішов у Notion, додатково лягає сюди — upsert по (run_id, article_id).
 draft_versions — історія драфту: v1 = те, що згенерував бекенд, далі кожна правка людини в Notion
 (її підтягує sync.py). sync_state — водяний знак синку (last_edited_time останньої обробленої сторінки).
+used_articles — використані статті: жодну не беремо двічі.
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ from datetime import datetime
 
 import psycopg
 
-from .models import DraftResult
+from .models import Article, DraftResult
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS drafts (
@@ -53,6 +54,19 @@ CREATE TABLE IF NOT EXISTS sync_state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS used_articles (
+    article_id    TEXT PRIMARY KEY,
+    article_url   TEXT NOT NULL UNIQUE,
+    article_title TEXT NOT NULL,
+    run_id        TEXT NOT NULL,                -- прогін, що взяв статтю
+    channel       TEXT,                         -- fb | x | NULL (кнопка без каналу)
+    claimed_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- статті, на які драфт уже є, теж використані (зокрема ті, що були до появи used_articles)
+INSERT INTO used_articles (article_id, article_url, article_title, run_id, claimed_at)
+SELECT DISTINCT ON (article_id) article_id, article_url, article_title, run_id, created_at
+FROM drafts ORDER BY article_id, created_at
+ON CONFLICT DO NOTHING;
 """
 
 
@@ -122,10 +136,28 @@ def add_version(page_id: str, headline: str, text: str, status: str | None, edit
         return _add_version(c, page_id, headline, text, status, edited_by, edited_at)
 
 
-def drafted_article_ids() -> set[str]:
-    """Статті, на які драфт уже є, — щоб кожен прогін брав наступну статтю з топу дня."""
+def used_article_ids() -> set[str]:
+    """Статті, які вже взяв якийсь прогін, — на них драфт є або пишеться просто зараз."""
     with _connect() as c:
-        return {r[0] for r in c.execute("SELECT DISTINCT article_id FROM drafts")}
+        return {r[0] for r in c.execute("SELECT article_id FROM used_articles")}
+
+
+def claim_article(article: Article, run_id: str, channel: str | None) -> bool:
+    """Забронювати статтю до генерації: модель пише хвилинами, а кнопку тиснуть кілька разів поспіль.
+    Атомарно (unique на article_id і url): False — статтю вже взяв інший прогін."""
+    with _connect() as c:
+        row = c.execute(
+            """INSERT INTO used_articles (article_id, article_url, article_title, run_id, channel)
+               VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING RETURNING article_id""",
+            (str(article.id), article.url, article.title, run_id, channel),
+        ).fetchone()
+    return row is not None
+
+
+def release_article(article_id: str, run_id: str) -> None:
+    """Драфт не дійшов до Notion (впала модель чи Notion) — стаття знову вільна для наступного прогону."""
+    with _connect() as c:
+        c.execute("DELETE FROM used_articles WHERE article_id = %s AND run_id = %s", (article_id, run_id))
 
 
 def known_pages() -> set[str]:

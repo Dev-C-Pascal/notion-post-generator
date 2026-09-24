@@ -20,19 +20,45 @@ log = logging.getLogger("pipeline")
 STATUS = "New draft"  # новий драфт чекає на рецензента; далі статуси ставить людина
 # канал кнопки → lang для моделі Артема: за мовою вона обирає і формат (uk — пост для FB, en — тред для X)
 CHANNEL_LANG = {"fb": "uk", "x": "en"}
+PICK_SPARE = 5  # скільки зайвих кандидатів брати на випадок, коли їх розбирають паралельні прогони
 
 
 def new_run_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
-def step_select(limit: int) -> list[tuple[Article, RelevanceResult]]:
-    """Статті з відбору Андрія, на які ще немає драфту. Порожньо — прогін нічого не пише."""
+def step_select(run_id: str, limit: int, channel: str | None = None) -> list[tuple[Article, RelevanceResult]]:
+    """Статті з відбору Андрія, яких ще не брав жоден прогін. Кожну бронюємо в used_articles до генерації,
+    тож кілька натискань поспіль отримують різні статті. Порожньо — прогін нічого не пише."""
     if not comms.enabled():
         log.warning("COMMS_DATABASE_URL не задано — статей немає")
         return []
-    drafted = pg.drafted_article_ids() if pg.enabled() else set()
-    return comms.fetch_picks(limit, drafted)
+    if not pg.enabled():  # локально: без бази драфтів бронювати нема де
+        return comms.fetch_picks(limit, set())
+    picks: list[tuple[Article, RelevanceResult]] = []
+    tried: set[str] = set()
+    while len(picks) < limit:
+        # із запасом: верх списку могли щойно розібрати паралельні прогони
+        batch = comms.fetch_picks(limit - len(picks) + PICK_SPARE, pg.used_article_ids() | tried)
+        if not batch:
+            break
+        for a, rel in batch:
+            tried.add(str(a.id))
+            if pg.claim_article(a, run_id, channel):
+                picks.append((a, rel))
+                if len(picks) == limit:
+                    break
+    return picks
+
+
+def release_unwritten(run_id: str, picks: list[tuple[Article, RelevanceResult]], written: set[str]) -> None:
+    """Прогін упав: статті, чий драфт не дійшов до Notion, знову вільні."""
+    for a, _ in picks:
+        if str(a.id) not in written:
+            try:
+                pg.release_article(str(a.id), run_id)
+            except Exception:
+                log.exception("run %s: не вдалося зняти бронь зі статті %s", run_id, a.id)
 
 
 async def step_write_notion(run_id: str, database_id: str, r: DraftResult, channel: str | None = None) -> str:
@@ -63,15 +89,17 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel
     t0 = time.monotonic()
     db.create_run(run_id, model.version)
     picks: list[tuple[Article, RelevanceResult]] = []
+    in_notion: set[str] = set()  # статті, чий драфт уже в Notion: бронь із них не знімаємо
     written = 0
     failure: str | None = None
     try:
-        picks = step_select(limit)
+        picks = step_select(run_id, limit, channel)
         for a, rel in picks:
             res = DraftResult(article=a, relevance=rel)
             # модель на RunPod відповідає хвилинами — в окремому потоці, щоб не блокувати /health і вебхуки
             res.draft = await asyncio.to_thread(model.draft, a, lang)
             res.notion_page_id = await step_write_notion(run_id, database_id, res, channel)
+            in_notion.add(str(a.id))
             if pg.enabled():
                 pg.save_draft(run_id, res, STATUS)
             written += 1
@@ -85,6 +113,8 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel
     except Exception as e:
         log.exception("run %s failed", run_id)
         status, failure = "failed", type(e).__name__
+        if pg.enabled():
+            release_unwritten(run_id, picks, in_notion)
     duration = int((time.monotonic() - t0) * 1000)
     db.finish_run(run_id, status=status, duration_ms=duration, articles_in=len(picks),
                   relevant_count=len(picks), drafts_written=written, failure_type=failure)

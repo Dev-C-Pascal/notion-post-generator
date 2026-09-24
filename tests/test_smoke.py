@@ -110,16 +110,57 @@ def test_picks_fall_back_to_topic_queue(monkeypatch):
     assert calls[1] == ("topic", (["a-top", "old"], 1))
 
 
-def test_select_skips_already_drafted(monkeypatch):
-    calls = []
-    monkeypatch.setattr(comms, "enabled", lambda: True)
-    monkeypatch.setattr(comms, "fetch_picks", lambda limit, exclude: calls.append((limit, exclude)) or [(ART, REL)])
-    monkeypatch.setattr(pg, "enabled", lambda: True)
-    monkeypatch.setattr(pg, "drafted_article_ids", lambda: {"old-uuid"})
-    assert pipeline.step_select(limit=2) == [(ART, REL)]
-    assert calls == [(2, {"old-uuid"})]
+def _art(aid: str) -> tuple[Article, RelevanceResult]:
+    return ART.model_copy(update={"id": aid, "url": f"https://x/{aid}"}), REL.model_copy(update={"article_id": aid})
+
+
+class FakeUsed:
+    """used_articles без Postgres. taken — те, що вже забронював інший прогін, але чого ще не було у знімку."""
+
+    def __init__(self, used=(), taken=()):
+        self.used, self.taken, self.released = dict.fromkeys(used, "old"), set(taken), []
+
+    def install(self, monkeypatch, feed: list[str]):
+        monkeypatch.setattr(comms, "enabled", lambda: True)
+        monkeypatch.setattr(pg, "enabled", lambda: True)
+        monkeypatch.setattr(comms, "fetch_picks", lambda limit, exclude: [_art(a) for a in feed if a not in exclude][:limit])
+        monkeypatch.setattr(pg, "used_article_ids", lambda: set(self.used))
+        monkeypatch.setattr(pg, "claim_article", self.claim)
+        monkeypatch.setattr(pg, "release_article", lambda aid, run_id: self.released.append((aid, run_id)))
+
+    def claim(self, article, run_id, channel):
+        aid = str(article.id)
+        if aid in self.used or aid in self.taken:
+            self.used.setdefault(aid, "other-run")
+            return False
+        self.used[aid] = run_id
+        return True
+
+
+def test_select_never_takes_used_article(monkeypatch):
+    fake = FakeUsed(used={"a1"})
+    fake.install(monkeypatch, ["a1", "a2", "a3"])
+    assert [a.id for a, _ in pipeline.step_select("r1", limit=1)] == ["a2"]  # a1 уже має драфт
+    assert [a.id for a, _ in pipeline.step_select("r2", limit=1)] == ["a3"]  # a2 забронював r1
+    assert pipeline.step_select("r3", limit=1) == []  # статті скінчились — прогін нічого не пише
+    assert fake.used == {"a1": "old", "a2": "r1", "a3": "r2"}
+
+
+def test_parallel_run_gets_next_article(monkeypatch):
+    # r1 ще генерує a2 (у знімку used його нема, але бронь уже стоїть) — r2 бере a3, а не дубль
+    fake = FakeUsed(taken={"a2"})
+    fake.install(monkeypatch, ["a2", "a3"])
+    assert [a.id for a, _ in pipeline.step_select("r2", limit=1)] == ["a3"]
+    # увесь запас розібрали паралельні прогони — повторна вибірка з новим знімком used
+    feed = [f"b{i}" for i in range(pipeline.PICK_SPARE + 3)]
+    fake = FakeUsed(taken=set(feed[:pipeline.PICK_SPARE + 1]))
+    fake.install(monkeypatch, feed)
+    assert [a.id for a, _ in pipeline.step_select("r3", limit=1)] == [feed[pipeline.PICK_SPARE + 1]]
+
+
+def test_select_without_comms_is_empty(monkeypatch):
     monkeypatch.setattr(comms, "enabled", lambda: False)
-    assert pipeline.step_select(limit=2) == []  # без бази Андрія статей немає — і заглушки теж
+    assert pipeline.step_select("r", limit=2) == []  # без бази Андрія статей немає — і заглушки теж
 
 
 @pytest.mark.asyncio
@@ -139,7 +180,7 @@ async def test_e2e_with_mock_notion(monkeypatch, tmp_path):
     monkeypatch.setattr(notion, "create_row", fake_create)
     monkeypatch.setattr(notion, "update_row", fake_update)
     picks = [(ART, REL)]
-    monkeypatch.setattr(pipeline, "step_select", lambda limit: picks)
+    monkeypatch.setattr(pipeline, "step_select", lambda run_id, limit, channel=None: picks)
     saved = []
     monkeypatch.setattr(pg, "enabled", lambda: True)
     monkeypatch.setattr(pg, "save_draft", lambda run_id, r, status: saved.append((run_id, r.notion_page_id, status)))
@@ -161,6 +202,22 @@ async def test_e2e_with_mock_notion(monkeypatch, tmp_path):
     picks.clear()
     empty = await pipeline.run_pipeline("run2", database_id="db", model=FakeModel())
     assert (empty.status, empty.drafts_written, len(created)) == ("ok", 0, 1)
+
+
+@pytest.mark.asyncio
+async def test_failed_run_releases_article(monkeypatch, tmp_path):
+    monkeypatch.setattr(db, "RUNS_DB", tmp_path / "runs.db")
+    db.init_db()
+    fake = FakeUsed()
+    fake.install(monkeypatch, ["a1"])
+
+    async def notion_down(database_id, properties, body=None):
+        raise httpx.ConnectTimeout("notion")
+
+    monkeypatch.setattr(notion, "create_row", notion_down)
+    summary = await pipeline.run_pipeline("r1", database_id="db", model=FakeModel())
+    assert (summary.status, summary.failure_type) == ("failed", "ConnectTimeout")
+    assert fake.released == [("a1", "r1")]  # драфт не дійшов до Notion — стаття знову вільна
 
 
 def test_api():
