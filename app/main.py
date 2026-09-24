@@ -2,7 +2,7 @@
 
 Потік:
   Notion (кнопка) --POST /webhook--> сервер --> 202 {run_id} одразу, робота у фоні:
-      fetch (articles.db) → relevance → extraction → draft → evaluate → write_notion (рядок у MVP)
+      select (топ дня Андрія) → draft (модель на RunPod) → write_notion (рядок у MVP) + postgen
       → runs.db: журнал прогону та драфтів
 """
 import logging
@@ -71,19 +71,18 @@ def _check_secret(request: Request) -> None:
         raise HTTPException(status_code=401, detail="bad secret")
 
 
-def _start_run(background: BackgroundTasks, topic: str | None = None) -> JSONResponse:
+def _start_run(background: BackgroundTasks) -> JSONResponse:
     run_id = pipeline.new_run_id()
-    background.add_task(pipeline.run_pipeline, run_id, database_id=DATABASE_ID, limit=RUN_LIMIT, topic=topic)
+    background.add_task(pipeline.run_pipeline, run_id, database_id=DATABASE_ID, limit=RUN_LIMIT)
     return JSONResponse(status_code=202, content={"run_id": run_id, "status": "running"})
 
 
 @app.post("/run", status_code=202)
 async def run(request: Request, background: BackgroundTasks) -> JSONResponse:
-    """Ручний/cron-тригер. Тіло (необов'язково): {"topic": "..."}."""
+    """Ручний/cron-тригер."""
     _check_secret(request)
-    body = await request.json() if int(request.headers.get("content-length") or 0) else {}
-    log.info("POST /run topic=%s", body.get("topic"))
-    return _start_run(background, body.get("topic"))
+    log.info("POST /run")
+    return _start_run(background)
 
 
 @app.post("/webhook", status_code=202)

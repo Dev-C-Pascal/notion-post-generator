@@ -14,18 +14,11 @@ class Article(BaseModel):
 
 
 class RelevanceResult(BaseModel):
+    """Чому стаття обрана: місце в топі дня векторного відбору Андрія (ml.daily_pick)."""
     article_id: int | str
     relevant: bool
     reason: str
-    score: float  # 0..1
-
-
-class Extraction(BaseModel):
-    article_id: int | str
-    main_claim: str
-    facts: list[str]
-    examples: list[str]
-    angle: str
+    score: float  # бал ранкера Андрія: ½ відповідність темі + ½ схожість на взірці
 
 
 class Draft(BaseModel):
@@ -35,18 +28,10 @@ class Draft(BaseModel):
     model_version: str
 
 
-class Evaluation(BaseModel):
-    article_id: int | str
-    quality_score: float  # 0..1
-    failure_type: str | None = None  # None = ok; інакше: too_short | off_topic | hallucination | ...
-
-
 class DraftResult(BaseModel):
     article: Article
     relevance: RelevanceResult
-    extraction: Extraction | None = None
     draft: Draft | None = None
-    evaluation: Evaluation | None = None
     notion_page_id: str | None = None
 
 

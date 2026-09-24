@@ -80,23 +80,18 @@ def content_hash(headline: str, text: str, status: str | None) -> str:
 
 
 def save_draft(run_id: str, r: DraftResult, status: str) -> None:
-    """Драфт + його перша версія (те, що бекенд відправив у Notion)."""
+    """Драфт + його перша версія (те, що бекенд відправив у Notion).
+    extraction / quality_score / failure_type лишаються NULL: цих кроків більше немає, оцінює людина."""
     assert r.draft
     with _connect() as c:
         c.execute(
             """INSERT INTO drafts (run_id, article_id, article_url, article_title, relevant, relevance_score, reason,
-                                   extraction, headline, text, quality_score, failure_type, model_version,
-                                   notion_page_id)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                   headline, text, model_version, notion_page_id)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (run_id, article_id) DO UPDATE SET
-                 headline = excluded.headline, text = excluded.text, quality_score = excluded.quality_score,
-                 failure_type = excluded.failure_type, notion_page_id = excluded.notion_page_id""",
+                 headline = excluded.headline, text = excluded.text, notion_page_id = excluded.notion_page_id""",
             (run_id, str(r.article.id), r.article.url, r.article.title, r.relevance.relevant, r.relevance.score,
-             r.relevance.reason, r.extraction.model_dump_json() if r.extraction else None,
-             r.draft.headline, r.draft.text,
-             r.evaluation.quality_score if r.evaluation else None,
-             r.evaluation.failure_type if r.evaluation else None,
-             r.draft.model_version, r.notion_page_id),
+             r.relevance.reason, r.draft.headline, r.draft.text, r.draft.model_version, r.notion_page_id),
         )
         if r.notion_page_id:
             _add_version(c, r.notion_page_id, r.draft.headline, r.draft.text, status, None, None)
@@ -125,6 +120,12 @@ def add_version(page_id: str, headline: str, text: str, status: str | None, edit
                 edited_at: datetime | None) -> bool:
     with _connect() as c:
         return _add_version(c, page_id, headline, text, status, edited_by, edited_at)
+
+
+def drafted_article_ids() -> set[str]:
+    """Статті, на які драфт уже є, — щоб кожен прогін брав наступну статтю з топу дня."""
+    with _connect() as c:
+        return {r[0] for r in c.execute("SELECT DISTINCT article_id FROM drafts")}
 
 
 def known_pages() -> set[str]:
