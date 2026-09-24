@@ -1,7 +1,8 @@
 """Pipeline одного прогону: select (топ дня Андрія) → draft (модель на RunPod) → write_notion + postgen.
 
 Релевантність — векторний відбір Андрія (bge-m3 + pgvector): топ дня, а поки його немає — тематичний відбір.
-Окремих кроків extraction / evaluate немає — оцінює людина в Notion (статус «Not started»).
+Окремих кроків extraction / evaluate немає — оцінює людина в Notion: статус «New draft», колонки рецензента,
+Score і Pass — формули в самій таблиці.
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ from .models import Article, DraftResult, RelevanceResult, RunSummary
 
 log = logging.getLogger("pipeline")
 
-STATUS = "Not started"  # новий драфт чекає на людину: approve / edit / reject
+STATUS = "New draft"  # новий драфт чекає на рецензента; далі статуси ставить людина
 # канал кнопки → lang для моделі Артема: за мовою вона обирає і формат (uk — пост для FB, en — тред для X)
 CHANNEL_LANG = {"fb": "uk", "x": "en"}
 

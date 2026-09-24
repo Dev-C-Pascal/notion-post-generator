@@ -150,10 +150,10 @@ async def test_e2e_with_mock_notion(monkeypatch, tmp_path):
     assert model.langs == ["uk"]  # кнопка FB → український пост
     props, body = created[0]
     assert props["Draft"]["title"][0]["text"]["content"] == ART.title
-    assert props["Status"]["select"]["name"] == "Not started"  # оцінює людина, не бекенд
+    assert props["Status"]["select"]["name"] == "New draft"  # оцінює людина, не бекенд
     assert "канал: fb · мова: uk" in body.split("\n\n")[0]
     assert body.endswith("пост 1/\n\nпост 2/")
-    assert saved == [("testrun", "page-1", "Not started")]  # драфт додатково пішов у Postgres
+    assert saved == [("testrun", "page-1", "New draft")]  # драфт додатково пішов у Postgres
     # upsert: повторний прогін з тим самим run_id не створює новий рядок
     await pipeline.run_pipeline("testrun", database_id="db", model=FakeModel())
     assert len(created) == 1
