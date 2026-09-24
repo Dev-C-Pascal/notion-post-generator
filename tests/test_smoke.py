@@ -28,8 +28,13 @@ REL = RelevanceResult(article_id=ART.id, relevant=True, reason="топ дня �
 class FakeModel:
     version = "fake"
 
-    def draft(self, article: Article) -> Draft:
-        return Draft(article_id=article.id, headline=article.title, text="пост 1/\n\nпост 2/", model_version=self.version)
+    def __init__(self):
+        self.langs: list = []
+
+    def draft(self, article: Article, lang: str | None = None) -> Draft:
+        self.langs.append(lang)
+        return Draft(article_id=article.id, headline=article.title, text="пост 1/\n\nпост 2/",
+                     model_version=self.version, lang=lang or "en")
 
 
 def _runpod(responses: list[dict], sent: list) -> RunPodModelClient:
@@ -45,9 +50,16 @@ def test_runpod_draft_waits_for_cold_start():
     m = _runpod([{"id": "j1", "status": "IN_QUEUE"}, {"id": "j1", "status": "IN_PROGRESS"},
                  {"id": "j1", "status": "COMPLETED", "output": {"post": " Пост 1/\n\nПост 2/ "}}], sent)
     d = m.draft(ART)
-    assert (d.headline, d.text, d.model_version) == (ART.title, "Пост 1/\n\nПост 2/", "runpod-ep1")
+    assert (d.headline, d.text, d.model_version, d.lang) == (ART.title, "Пост 1/\n\nПост 2/", "runpod-ep1", "uk")
     assert sent[0] == ("POST", "/v2/ep1/runsync", {"input": {"article_text": ART.text, "lang": "uk"}})
     assert [s[1] for s in sent[1:]] == ["/v2/ep1/status/j1"] * 2
+
+
+def test_runpod_lang_from_channel_overrides_article():
+    sent: list = []
+    m = _runpod([{"id": "j3", "status": "COMPLETED", "output": {"post": "Thread 1/"}}], sent)
+    assert m.draft(ART, lang="en").lang == "en"  # стаття українська, але кнопка X просить англійський тред
+    assert sent[0][2]["input"]["lang"] == "en"
 
 
 def test_runpod_failed_job_raises():
@@ -132,11 +144,14 @@ async def test_e2e_with_mock_notion(monkeypatch, tmp_path):
     monkeypatch.setattr(pg, "enabled", lambda: True)
     monkeypatch.setattr(pg, "save_draft", lambda run_id, r, status: saved.append((run_id, r.notion_page_id, status)))
     db.init_db()
-    summary = await pipeline.run_pipeline("testrun", database_id="db", model=FakeModel())
+    model = FakeModel()
+    summary = await pipeline.run_pipeline("testrun", database_id="db", channel="fb", model=model)
     assert summary.status == "ok" and summary.drafts_written == 1
+    assert model.langs == ["uk"]  # кнопка FB → український пост
     props, body = created[0]
     assert props["Draft"]["title"][0]["text"]["content"] == ART.title
     assert props["Status"]["select"]["name"] == "Not started"  # оцінює людина, не бекенд
+    assert "канал: fb · мова: uk" in body.split("\n\n")[0]
     assert body.endswith("пост 1/\n\nпост 2/")
     assert saved == [("testrun", "page-1", "Not started")]  # драфт додатково пішов у Postgres
     # upsert: повторний прогін з тим самим run_id не створює новий рядок
@@ -154,4 +169,10 @@ def test_api():
         assert c.post("/webhook", json={"data": {"object": "page", "id": "x"}}).status_code == 401
         r = c.post("/run", headers={"x-webhook-secret": "t"})
         assert r.status_code == 202 and "run_id" in r.json()
+        hook = {"data": {"object": "page", "id": "x"}}
+        for path, channel in (("/webhook/fb", "fb"), ("/webhook/x", "x"), ("/webhook", None), ("/run?channel=x", "x")):
+            r = c.post(path, json=hook, headers={"x-webhook-secret": "t"})
+            assert (r.status_code, r.json()["channel"]) == (202, channel), path
+        assert c.post("/webhook/tiktok", json=hook, headers={"x-webhook-secret": "t"}).status_code == 404
+        assert c.post("/webhook/fb", json=hook).status_code == 401
         assert c.get("/runs/nope").status_code == 404

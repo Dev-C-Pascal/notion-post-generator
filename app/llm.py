@@ -19,7 +19,7 @@ RUNPOD_API = "https://api.runpod.ai/v2"
 class ModelClient(Protocol):
     version: str
 
-    def draft(self, article: Article) -> Draft: ...
+    def draft(self, article: Article, lang: str | None = None) -> Draft: ...
 
 
 class ModelError(RuntimeError):
@@ -36,7 +36,8 @@ def detect_lang(text: str) -> str:
 class RunPodModelClient:
     """POST /runsync {"input": {"article_text", "lang"}} → {"status": "COMPLETED", "output": {"post": "..."}}.
 
-    lang — мова поста (не статті); беремо мову статті. На холодному старті runsync через ~90 с віддає
+    lang — мова й формат поста, не мова статті: uk — довгий пост для FB, en — тред для X.
+    Не задано — беремо мову статті. На холодному старті runsync через ~90 с віддає
     IN_QUEUE / IN_PROGRESS без output — тоді опитуємо /status/{id}.
     """
 
@@ -47,9 +48,10 @@ class RunPodModelClient:
         self.headers = {"Authorization": f"Bearer {api_key}"}
         self.timeout_s, self.poll_s, self.transport = timeout_s, poll_s, transport
 
-    def draft(self, article: Article) -> Draft:
-        post = self._run({"article_text": article.text, "lang": detect_lang(article.text)})
-        return Draft(article_id=article.id, headline=article.title, text=post, model_version=self.version)
+    def draft(self, article: Article, lang: str | None = None) -> Draft:
+        lang = lang or detect_lang(article.text)
+        post = self._run({"article_text": article.text, "lang": lang})
+        return Draft(article_id=article.id, headline=article.title, text=post, model_version=self.version, lang=lang)
 
     def _run(self, payload: dict) -> str:
         deadline = time.monotonic() + self.timeout_s

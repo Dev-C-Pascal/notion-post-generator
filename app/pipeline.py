@@ -17,6 +17,8 @@ from .models import Article, DraftResult, RelevanceResult, RunSummary
 log = logging.getLogger("pipeline")
 
 STATUS = "Not started"  # новий драфт чекає на людину: approve / edit / reject
+# канал кнопки → lang для моделі Артема: за мовою вона обирає і формат (uk — пост для FB, en — тред для X)
+CHANNEL_LANG = {"fb": "uk", "x": "en"}
 
 
 def new_run_id() -> str:
@@ -32,7 +34,7 @@ def step_select(limit: int) -> list[tuple[Article, RelevanceResult]]:
     return comms.fetch_picks(limit, drafted)
 
 
-async def step_write_notion(run_id: str, database_id: str, r: DraftResult) -> str:
+async def step_write_notion(run_id: str, database_id: str, r: DraftResult, channel: str | None = None) -> str:
     """Upsert у Notion: якщо для (article_id, run_id) рядок уже є — оновлюємо, інакше створюємо."""
     assert r.draft
     props = notion.build_properties(
@@ -41,7 +43,7 @@ async def step_write_notion(run_id: str, database_id: str, r: DraftResult) -> st
         status=STATUS,
     )
     body = (
-        f"run_id: {run_id} · model: {r.draft.model_version}\n\n"
+        f"run_id: {run_id} · model: {r.draft.model_version} · канал: {channel or 'auto'} · мова: {r.draft.lang}\n\n"
         f"{r.draft.text}"
     )
     existing = db.find_draft_page(r.article.id, run_id)
@@ -52,8 +54,11 @@ async def step_write_notion(run_id: str, database_id: str, r: DraftResult) -> st
     return page["id"]
 
 
-async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, model: ModelClient | None = None) -> RunSummary:
+async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel: str | None = None,
+                       model: ModelClient | None = None) -> RunSummary:
+    """channel — fb | x | None (мова поста = мова статті)."""
     model = model or get_model_client()
+    lang = CHANNEL_LANG[channel] if channel else None
     t0 = time.monotonic()
     db.create_run(run_id, model.version)
     picks: list[tuple[Article, RelevanceResult]] = []
@@ -64,8 +69,8 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, model: 
         for a, rel in picks:
             res = DraftResult(article=a, relevance=rel)
             # модель на RunPod відповідає хвилинами — в окремому потоці, щоб не блокувати /health і вебхуки
-            res.draft = await asyncio.to_thread(model.draft, a)
-            res.notion_page_id = await step_write_notion(run_id, database_id, res)
+            res.draft = await asyncio.to_thread(model.draft, a, lang)
+            res.notion_page_id = await step_write_notion(run_id, database_id, res, channel)
             if pg.enabled():
                 pg.save_draft(run_id, res, STATUS)
             written += 1

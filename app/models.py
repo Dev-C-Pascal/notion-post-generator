@@ -26,6 +26,7 @@ class Draft(BaseModel):
     headline: str
     text: str
     model_version: str
+    lang: str  # мова поста, яку попросили в моделі: uk | en
 
 
 class DraftResult(BaseModel):

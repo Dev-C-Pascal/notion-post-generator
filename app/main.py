@@ -71,25 +71,29 @@ def _check_secret(request: Request) -> None:
         raise HTTPException(status_code=401, detail="bad secret")
 
 
-def _start_run(background: BackgroundTasks) -> JSONResponse:
+def _start_run(background: BackgroundTasks, channel: str | None) -> JSONResponse:
+    if channel and channel not in pipeline.CHANNEL_LANG:
+        raise HTTPException(status_code=404, detail=f"unknown channel, expected one of {sorted(pipeline.CHANNEL_LANG)}")
     run_id = pipeline.new_run_id()
-    background.add_task(pipeline.run_pipeline, run_id, database_id=DATABASE_ID, limit=RUN_LIMIT)
-    return JSONResponse(status_code=202, content={"run_id": run_id, "status": "running"})
+    background.add_task(pipeline.run_pipeline, run_id, database_id=DATABASE_ID, limit=RUN_LIMIT, channel=channel)
+    return JSONResponse(status_code=202, content={"run_id": run_id, "status": "running", "channel": channel})
 
 
 @app.post("/run", status_code=202)
-async def run(request: Request, background: BackgroundTasks) -> JSONResponse:
-    """Ручний/cron-тригер."""
+async def run(request: Request, background: BackgroundTasks, channel: str | None = None) -> JSONResponse:
+    """Ручний/cron-тригер. ?channel=fb|x — під який канал писати пост (без нього — мовою статті)."""
     _check_secret(request)
-    log.info("POST /run")
-    return _start_run(background)
+    log.info("POST /run channel=%s", channel)
+    return _start_run(background, channel)
 
 
 @app.post("/webhook", status_code=202)
-async def webhook(request: Request, background: BackgroundTasks) -> JSONResponse:
-    """Тригер з кнопки Notion (Send webhook). Payload: {"source": {...}, "data": {<page object>}}."""
+@app.post("/webhook/{channel}", status_code=202)
+async def webhook(request: Request, background: BackgroundTasks, channel: str | None = None) -> JSONResponse:
+    """Тригер з кнопки Notion (Send webhook). Payload: {"source": {...}, "data": {<page object>}}.
+    Кнопка на канал: /webhook/fb — український пост для FB, /webhook/x — англійський тред для X."""
     _check_secret(request)
     payload = await request.json()
     page = payload.get("data") or {}
-    log.info("webhook from page=%s", page.get("id"))
-    return _start_run(background)
+    log.info("webhook from page=%s channel=%s", page.get("id"), channel)
+    return _start_run(background, channel)
