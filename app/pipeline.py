@@ -1,6 +1,6 @@
 """Pipeline одного прогону: select (топ дня Андрія) → draft (модель на RunPod) → write_notion + postgen.
 
-Релевантність — векторний відбір Андрія (bge-m3 + pgvector): стаття береться з його топу дня.
+Релевантність — векторний відбір Андрія (bge-m3 + pgvector): топ дня, а поки його немає — тематичний відбір.
 Окремих кроків extraction / evaluate немає — оцінює людина в Notion (статус «Not started»).
 """
 from __future__ import annotations
@@ -24,12 +24,12 @@ def new_run_id() -> str:
 
 
 def step_select(limit: int) -> list[tuple[Article, RelevanceResult]]:
-    """Найвищі в топі дня статті, на які ще немає драфту. Порожньо — прогін нічого не пише."""
+    """Статті з відбору Андрія, на які ще немає драфту. Порожньо — прогін нічого не пише."""
     if not comms.enabled():
         log.warning("COMMS_DATABASE_URL не задано — статей немає")
         return []
     drafted = pg.drafted_article_ids() if pg.enabled() else set()
-    return comms.fetch_top_picks(limit, drafted)
+    return comms.fetch_picks(limit, drafted)
 
 
 async def step_write_notion(run_id: str, database_id: str, r: DraftResult) -> str:

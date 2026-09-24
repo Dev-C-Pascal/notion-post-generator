@@ -64,10 +64,44 @@ def test_model_client_requires_runpod(monkeypatch):
     assert (detect_lang("Нацбанк зберіг ставку"), detect_lang("NBU kept the rate")) == ("uk", "en")
 
 
+TOP_ROW = ("a-top", "https://x/top", "Top", "текст", "Reuters", "2026-09-24", 1, 0.612, "Стан економіки РФ", 3)
+TOPIC_ROW = ("a-topic", "https://x/topic", "Topic", "текст", "Kyiv Post", "2026-09-24", "Війна в Україні", 0.669)
+
+
+def _fake_db(monkeypatch, top: list, topic: list) -> list:
+    """comms._query без Postgres: TOP_PICKS → top, TOPIC_PICKS → topic. Повертає журнал запитів."""
+    calls: list = []
+
+    def query(sql, params):
+        calls.append(("top" if sql == comms.TOP_PICKS else "topic", params))
+        return top if sql == comms.TOP_PICKS else topic
+    monkeypatch.setattr(comms, "_query", query)
+    return calls
+
+
+def test_picks_prefer_daily_top(monkeypatch):
+    calls = _fake_db(monkeypatch, [TOP_ROW], [TOPIC_ROW])
+    [(a, rel)] = comms.fetch_picks(1, {"old"})
+    assert (a.id, a.topic) == ("a-top", "Стан економіки РФ")
+    assert rel.reason.startswith("топ дня №1") and rel.score == 0.612
+    assert calls == [("top", (["old"], 1))]  # топу вистачило — тематичний відбір не чіпаємо
+
+
+def test_picks_fall_back_to_topic_queue(monkeypatch):
+    calls = _fake_db(monkeypatch, [], [TOPIC_ROW])
+    [(a, rel)] = comms.fetch_picks(1, {"old"})
+    assert a.id == "a-topic" and "тематичний відбір" in rel.reason and "Війна в Україні" in rel.reason
+    assert calls == [("top", (["old"], 1)), ("topic", (["old"], 1))]
+    # топ дав менше, ніж треба: решта з тематичного, без статей, уже взятих із топу
+    calls = _fake_db(monkeypatch, [TOP_ROW], [TOPIC_ROW])
+    assert [a.id for a, _ in comms.fetch_picks(2, {"old"})] == ["a-top", "a-topic"]
+    assert calls[1] == ("topic", (["a-top", "old"], 1))
+
+
 def test_select_skips_already_drafted(monkeypatch):
     calls = []
     monkeypatch.setattr(comms, "enabled", lambda: True)
-    monkeypatch.setattr(comms, "fetch_top_picks", lambda limit, exclude: calls.append((limit, exclude)) or [(ART, REL)])
+    monkeypatch.setattr(comms, "fetch_picks", lambda limit, exclude: calls.append((limit, exclude)) or [(ART, REL)])
     monkeypatch.setattr(pg, "enabled", lambda: True)
     monkeypatch.setattr(pg, "drafted_article_ids", lambda: {"old-uuid"})
     assert pipeline.step_select(limit=2) == [(ART, REL)]
