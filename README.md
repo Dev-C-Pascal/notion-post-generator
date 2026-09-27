@@ -1,48 +1,77 @@
-# Post Generator — MLOps-прототип (Notion → webhook → backend → Notion)
+# Comms Product — генератор драфтів постів (Notion → бекенд → модель → Notion)
+
+Бекенд MVP Comms Product (KSE). Кнопка в Notion запускає прогін: бекенд бере свіжу статтю з відбору
+Data Architect, модель ML-команди пише за нею пост у стилі Тимофія Милованова, драфт з'являється рядком
+у таблиці MVP, де його оцінює рецензент.
+
+Повна передача контексту (рішення, інциденти, відкриті питання) — у [`CONTEXT.md`](CONTEXT.md).
 
 ## Потік
-1. На сторінці Notion натискаєш кнопку → Notion шле POST `/webhook` (JSON з page object).
-2. Бекенд (FastAPI) одразу відповідає `{"accepted": true}` і у фоні:
-   - `articles.db` — обирає статтю (заглушка LLM: `app/llm.py`);
-   - пише пост (заглушка LLM);
-   - Notion API: створює рядок у таблиці MVP (`Draft`, `Source`, `Status=Done`, `Score`),
-     або оновлює рядок, якщо кнопка стояла в рядку;
-   - `posts.db` — журнал генерації (`posts.article_id → articles.id`).
 
-## Структура
 ```
-app/main.py    FastAPI: /webhook, /health, /notion/check, /articles, /posts
-app/notion.py  клієнт Notion REST API (get page, create/update row)
-app/db.py      дві SQLite-бази: articles.db, posts.db
-app/llm.py     заглушка LLM: select_article, write_post, score_article
-tests/         smoke-тести (без Notion)
+Notion, сторінка «Сomms product» (воркспейс TM Space)
+  кнопка FB ─► POST /webhook/fb   (український пост)
+  кнопка X  ─► POST /webhook/x    (англійський тред)
+        │  заголовок x-webhook-secret; бекенд одразу відповідає 202 {run_id, channel}
+        ▼
+FastAPI (EC2, Docker, Caddy TLS) → у фоні pipeline.run_pipeline:
+  1. select  стаття з відбору Андрія (база comms, лише SELECT), з повним текстом і ще не взята:
+             топ дня (ml.daily_pick) → якщо порожньо, тематична черга (marts.topic_queue).
+             Стаття бронюється в postgen.used_articles ДО генерації — двічі не береться.
+  2. draft   модель на RunPod Serverless: lang = uk (FB) | en (X), 2–5 хв
+  3. notion  рядок у таблиці MVP: Draft, Source, Status = «New draft»; тіло — run_id · модель · канал + пост
+  4. store   postgen: drafts + draft_versions (v1); runs.db: журнал прогону
+  збій → бронь знімається, стаття повертається в чергу
 ```
+
+Черги статей наповнює стек Андрія на тому ж сервері (`/opt/comms`): `score_topics` двічі на годину,
+`rank_daily` щогодини.
+
+## Код
+
+```
+app/main.py      FastAPI: POST /webhook, /webhook/{fb|x}, /run; GET /health, /notion/check, /runs, /runs/{id}, /articles
+app/pipeline.py  прогін: select → draft → notion → store; канал → мова
+app/comms.py     читання статей з бази Андрія (топ дня, тематична черга)
+app/llm.py       ModelClient + RunPodModelClient (runsync, опитування статусу, скасування через 10 хв)
+app/notion.py    Notion REST API 2022-06-28: створення рядка, тіло сторінки частинами по 100 блоків
+app/pg.py        Postgres postgen: drafts, draft_versions, used_articles, sync_state
+app/db.py        SQLite runs.db: журнал прогонів
+app/models.py    pydantic-моделі кроків
+tests/           unit, e2e з mock-Notion, API
+```
+
+## Змінні середовища
+
+Шаблон — [`.env.example`](.env.example). Реальні значення лише в `.env` на сервері, не в git.
+
+| Змінна | Що |
+|---|---|
+| `NOTION_TOKEN`, `NOTION_DATABASE_ID` | інтеграція Notion і таблиця MVP |
+| `NOTION_PROP_DRAFT/SOURCE/STATUS` | назви колонок, якщо їх перейменують |
+| `WEBHOOK_SECRET` | має збігатися із заголовком `x-webhook-secret` у кнопках |
+| `COMMS_DATABASE_URL` | база статей Андрія (без неї статей немає) |
+| `POSTGEN_DB_PASSWORD` | наша база драфтів (сервіс `db` у compose) |
+| `RUNPOD_ENDPOINT_ID`, `RUNPOD_API_KEY` | модель; без них `/health` = 500 і деплой відкочується |
 
 ## Локально
+
 ```bash
 pip install -r requirements-dev.txt
-cp .env.example .env            # вписати NOTION_TOKEN
-./run.sh                        # http://localhost:8000
-cloudflared tunnel --url http://localhost:8000   # публічний https для Notion
-pytest -q
+ruff check app tests && mypy app && pytest -q
+./run.sh    # http://localhost:8000
 ```
 
-## Notion (один раз)
-1. notion.so/profile/integrations → New integration → Internal Integration Secret → `.env` `NOTION_TOKEN`.
-2. Сторінка з таблицею → `...` → Connections → додати інтеграцію.
-3. Кнопка → Send webhook: URL `https://<host>/webhook`, header `x-webhook-secret: <WEBHOOK_SECRET>`, content `This page`.
+## Деплой
 
-## AWS (EC2, Docker)
-1. EC2 Ubuntu, відкрити порти 22, 80, 443. DNS A-запис домену → IP інстансу.
-2. На сервері: `sudo apt install -y docker.io docker-compose-v2 git`, `git clone <repo> ~/post-generator`.
-3. `cp .env.example .env`, вписати `NOTION_TOKEN`, `WEBHOOK_SECRET`, `DOMAIN=<домен>`.
-4. `docker compose up -d --build` → `https://<домен>/health`.
-5. У Notion-кнопці замінити URL вебхука на `https://<домен>/webhook`.
+- `ci.yml` — на кожен push: ruff, mypy, pytest, `docker build` з тегом git sha.
+- `deploy.yml` — push у `main`: SSH на EC2 → checkout sha → `IMAGE_TAG=<sha> docker compose up -d --build`
+  → smoke `/health` → при збої відкат на попередній sha. Деплой перезапускає бекенд і обриває прогони,
+  що йдуть: перед пушем перевірити `GET /runs`.
+- `cron.yml` — щоденний `POST /run` (зараз падає: не заданий секрет `WEBHOOK_SECRET` у GitHub).
 
-## CI/CD (GitHub Actions)
-- `ci.yml`: на кожен push — ruff, pytest, docker build.
-- `deploy.yml`: push у `main` → SSH на EC2 → `git pull` → `docker compose up -d --build`.
-  Secrets у репозиторії: `EC2_HOST`, `EC2_USER` (ubuntu), `EC2_SSH_KEY` (приватний ключ).
+Перезапуск на сервері вручну — лише з тегом образу, інакше compose підніме старий `post-generator:local`:
 
-## Заміна заглушки на модель
-Тільки `app/llm.py`: `select_article`, `write_post`, `score_article`. Решта не змінюється.
+```bash
+cd ~/post-generator && IMAGE_TAG=$(git rev-parse HEAD) docker compose up -d app
+```
