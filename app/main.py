@@ -5,6 +5,7 @@
       select (топ дня Андрія) → draft (модель на RunPod) → write_notion (рядок у MVP) + postgen
       → runs.db: журнал прогону та драфтів
 """
+import hmac
 import logging
 import os
 
@@ -20,7 +21,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("post-generator")
 
 DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "").replace("-", "")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+# порожній чи значення з .env.example: будь-хто, хто знайде адресу, запускав би генерацію за гроші RunPod
+WEAK_SECRETS = {"", "change-me"}
 RUN_LIMIT = int(os.environ.get("RUN_ARTICLES", "1"))  # скільки статей обробляти за один прогін
 
 app = FastAPI(title="Post generator (MLOps prototype)")
@@ -28,6 +31,8 @@ app = FastAPI(title="Post generator (MLOps prototype)")
 
 @app.on_event("startup")
 def _startup() -> None:
+    if WEBHOOK_SECRET in WEAK_SECRETS:
+        raise RuntimeError("WEBHOOK_SECRET порожній або стандартний (change-me) — згенерувати: openssl rand -hex 24")
     db.init_db()
     if pg.enabled():
         pg.init_db()
@@ -67,7 +72,8 @@ def run_status(run_id: str) -> dict:
 
 
 def _check_secret(request: Request) -> None:
-    if WEBHOOK_SECRET and request.headers.get("x-webhook-secret") != WEBHOOK_SECRET:
+    given = request.headers.get("x-webhook-secret", "")
+    if not hmac.compare_digest(given.encode(), WEBHOOK_SECRET.encode()):
         raise HTTPException(status_code=401, detail="bad secret")
 
 
@@ -93,7 +99,10 @@ async def webhook(request: Request, background: BackgroundTasks, channel: str | 
     """Тригер з кнопки Notion (Send webhook). Payload: {"source": {...}, "data": {<page object>}}.
     Кнопка на канал: /webhook/fb — український пост для FB, /webhook/x — англійський тред для X."""
     _check_secret(request)
-    payload = await request.json()
-    page = payload.get("data") or {}
+    try:
+        payload = await request.json()
+    except ValueError:  # тіло не JSON — сторінка лише для журналу, прогону це не заважає
+        payload = {}
+    page = (payload.get("data") if isinstance(payload, dict) else None) or {}
     log.info("webhook from page=%s channel=%s", page.get("id"), channel)
     return _start_run(background, channel)

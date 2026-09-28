@@ -15,7 +15,7 @@ import httpx  # noqa: E402
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app import comms, db, notion, pg, pipeline  # noqa: E402
+from app import comms, db, main, notion, pg, pipeline  # noqa: E402
 from app.llm import ModelError, RunPodModelClient, detect_lang, get_model_client  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Article, Draft, RelevanceResult  # noqa: E402
@@ -232,4 +232,14 @@ def test_api():
             assert (r.status_code, r.json()["channel"]) == (202, channel), path
         assert c.post("/webhook/tiktok", json=hook, headers={"x-webhook-secret": "t"}).status_code == 404
         assert c.post("/webhook/fb", json=hook).status_code == 401
+        assert c.post("/webhook/fb", json=hook, headers={"x-webhook-secret": "change-me"}).status_code == 401
+        # тіло не JSON: автентифікація та сама, помилки 500 немає
+        assert c.post("/webhook/fb", content=b"", headers={"x-webhook-secret": "t"}).status_code == 202
         assert c.get("/runs/nope").status_code == 404
+
+
+@pytest.mark.parametrize("secret", ["", "change-me"])
+def test_refuses_to_start_with_weak_secret(monkeypatch, secret):
+    monkeypatch.setattr(main, "WEBHOOK_SECRET", secret)
+    with pytest.raises(RuntimeError, match="WEBHOOK_SECRET"), TestClient(app):
+        pass
