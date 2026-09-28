@@ -1,0 +1,23 @@
+name: CI
+on:
+  push:
+    # лише документація — ні тестів, ні деплою (деплой запускається після зеленого CI і перезапускає бекенд)
+    paths-ignore: ["**.md"]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check app tests
+      - run: mypy app
+      - run: pytest -q
+      - run: docker build -t post-generator:${{ github.sha }} .
+      # помилка в Caddyfile поклала б HTTPS цілком, а smoke бекенду лишився б зеленим
+      - name: Validate Caddyfile
+        run: >-
+          docker run --rm -e DOMAIN=example.com -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2
+          caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile

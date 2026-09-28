@@ -1,0 +1,65 @@
+name: Deploy
+on:
+  # Деплой — лише після зеленого CI на push у main (ruff, mypy, pytest, docker build).
+  # Немає CI (впав, не запускався, зник ci.yml, як у 59b8d2b 28.09) — немає й деплою.
+  # Коміти лише з *.md CI пропускає (paths-ignore у ci.yml), тож вони й не деплояться.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "staging або prod"
+        default: staging
+# один деплой за раз: наступний чекає, поки завершиться попередній
+concurrency: deploy
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    # staging за замовчуванням; prod — вручну через workflow_dispatch. Секрети окремі на кожен environment.
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    steps:
+      - name: Deploy image tagged with git sha, smoke-test, rollback on failure
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            # коміт, який пройшов CI (для workflow_run github.sha — це вже поточний main, не він)
+            SHA=${{ github.event.workflow_run.head_sha || github.sha }}
+            cd ~/post-generator
+            PREV=$(git rev-parse HEAD)
+            git fetch -q
+            # CI старішого коміту міг завершитись пізніше за новіший — назад не відкочуємось
+            if [ "$PREV" != "$SHA" ] && git merge-base --is-ancestor "$SHA" "$PREV"; then
+              echo "на сервері вже новіша версія $PREV — $SHA не деплоїмо"
+              exit 0
+            fi
+            git checkout -q "$SHA"
+            # тег образу — ще й у .env: тоді ручний `docker compose up -d app` підніме цю версію, а не старий :local
+            sed -i '/^IMAGE_TAG=/d' .env && echo "IMAGE_TAG=$SHA" >> .env
+            export IMAGE_TAG=$SHA
+            docker compose up -d --build
+            # Caddy читає Caddyfile лише на старті, а compose не перестворює контейнер через зміну вмісту файлу
+            CADDY_CHANGED=$(git diff --quiet "$PREV" "$SHA" -- Caddyfile || echo yes)
+            [ -z "$CADDY_CHANGED" ] || docker compose up -d --force-recreate --no-deps caddy
+            sleep 5
+            DOMAIN=$(grep '^DOMAIN=' .env | cut -d= -f2)
+            # і бекенд напряму, і HTTPS через Caddy (--resolve: той самий сертифікат, без виходу в інтернет)
+            if ! curl -fsS --retry 5 --retry-delay 3 --retry-all-errors http://127.0.0.1:8000/health \
+               || ! curl -fsS -o /dev/null --retry 5 --retry-delay 3 --retry-all-errors \
+                    --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/health"; then
+              echo "smoke failed → rollback to $PREV"
+              git checkout -q $PREV
+              sed -i '/^IMAGE_TAG=/d' .env && echo "IMAGE_TAG=$PREV" >> .env
+              IMAGE_TAG=$PREV docker compose up -d --build
+              [ -z "$CADDY_CHANGED" ] || docker compose up -d --force-recreate --no-deps caddy
+              exit 1
+            fi
+            docker compose ps
