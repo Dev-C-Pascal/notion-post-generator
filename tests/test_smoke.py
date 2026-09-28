@@ -223,6 +223,34 @@ async def test_failed_run_releases_article(monkeypatch, tmp_path):
     assert fake.released == [("a1", "r1")]  # драфт не дійшов до Notion — стаття знову вільна
 
 
+@pytest.mark.asyncio
+async def test_notion_retries_only_when_request_did_not_happen(monkeypatch):
+    monkeypatch.setenv("NOTION_TOKEN", "test-token")
+    monkeypatch.setattr(notion, "BACKOFF_S", 0)
+    replies: list = [httpx.ConnectTimeout("dns"), httpx.Response(429, headers={"Retry-After": "0"}),
+                     httpx.Response(200, json={"id": "p1"})]
+    sent: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.method)
+        r = replies.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    # не з'єднались, потім rate limit — запит точно не виконався, третя спроба створює рядок
+    assert (await notion.create_row("db", {}, body="текст"))["id"] == "p1"
+    assert sent == ["POST"] * 3
+    # ReadTimeout: запит міг дійти до Notion — не повторюємо, щоб не створити дубль
+    replies[:] = [httpx.ReadTimeout("slow"), httpx.Response(200, json={"id": "p2"})]
+    sent.clear()
+    with pytest.raises(httpx.ReadTimeout):
+        await notion.create_row("db", {})
+    assert sent == ["POST"]
+
+
 class SlowModel(FakeModel):
     """Модель, що «генерує» 0,3 с і рахує, скільки генерацій ішло одночасно."""
 
