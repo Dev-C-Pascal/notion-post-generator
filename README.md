@@ -68,7 +68,7 @@ ruff check app tests && mypy app && pytest -q
 - `deploy.yml` — push у `main`: SSH на EC2 → checkout sha → `IMAGE_TAG=<sha> docker compose up -d --build`
   → smoke `/health` → при збої відкат на попередній sha. Деплой перезапускає бекенд і обриває прогони,
   що йдуть: перед пушем перевірити `GET /runs`.
-- `cron.yml` — щоденний `POST /run` (зараз падає: не заданий секрет `WEBHOOK_SECRET` у GitHub).
+- `cron.yml` — `POST /run` лише вручну (Actions → Run workflow); щоденний розклад вимкнено 28.09.
 
 Перезапуск на сервері вручну — лише з тегом образу, інакше compose підніме старий `post-generator:local`:
 
