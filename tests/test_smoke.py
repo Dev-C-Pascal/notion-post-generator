@@ -224,6 +224,9 @@ async def test_failed_run_releases_article(monkeypatch, tmp_path):
     summary = await pipeline.run_pipeline("r1", database_id="db", model=FakeModel())
     assert (summary.status, summary.failure_type) == ("failed", "ConnectTimeout")
     assert fake.released == [("a1", "r1")]  # драфт не дійшов до Notion — стаття знову вільна
+    run = db.get_run("r1")  # у журналі — крок, стаття і текст помилки, а не лише назва класу
+    assert run and run["failure_step"] == "notion"
+    assert run["failure_detail"] == "article a1 (https://x/a1): notion"
 
 
 @pytest.mark.asyncio

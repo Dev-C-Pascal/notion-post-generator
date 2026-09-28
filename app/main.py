@@ -8,6 +8,7 @@
 import hmac
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -17,7 +18,11 @@ from . import db, notion, pg, pipeline
 from .llm import get_model_client
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# логи й у файл на volume (/srv/data): stdout контейнера зникає при кожному деплої, а з ним і причини збоїв
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", handlers=[
+    logging.StreamHandler(),
+    RotatingFileHandler(db.DATA_DIR / "app.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"),
+])
 log = logging.getLogger("post-generator")
 
 DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "").replace("-", "")

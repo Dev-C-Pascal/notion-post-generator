@@ -100,14 +100,21 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel
     in_notion: set[str] = set()  # статті, чий драфт уже в Notion: бронь із них не знімаємо
     written = 0
     failure: str | None = None
+    step, current = "select", None  # для діагностики: на якому кроці і з якою статтею впав прогін
+    failure_step: str | None = None
+    failure_detail: str | None = None
     try:
         picks = step_select(run_id, limit, channel)
         for a, rel in picks:
+            current = a
             res = DraftResult(article=a, relevance=rel)
+            step = "model"
             # модель на RunPod відповідає хвилинами — у власному пулі, щоб не блокувати вебхуки й запити до Notion
             res.draft = await asyncio.get_running_loop().run_in_executor(_MODEL_POOL, model.draft, a, lang)
+            step = "notion"
             res.notion_page_id = await step_write_notion(run_id, database_id, res, channel)
             in_notion.add(str(a.id))
+            step = "store"
             if pg.enabled():
                 pg.save_draft(run_id, res, STATUS)
             written += 1
@@ -119,12 +126,19 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel
             )
         status = "ok"
     except Exception as e:
-        log.exception("run %s failed", run_id)
-        status, failure = "failed", type(e).__name__
+        log.exception("run %s failed at %s", run_id, step)
+        status, failure, failure_step = "failed", type(e).__name__, step
+        # текст помилки (для моделі — з id задачі RunPod), а не лише назва класу
+        failure_detail = (f"article {current.id} ({current.url}): " if current else "") + str(e)
+        failure_detail = failure_detail[:500]
         if pg.enabled():
             release_unwritten(run_id, picks, in_notion)
     duration = int((time.monotonic() - t0) * 1000)
-    db.finish_run(run_id, status=status, duration_ms=duration, articles_in=len(picks),
-                  relevant_count=len(picks), drafts_written=written, failure_type=failure)
+    try:
+        db.finish_run(run_id, status=status, duration_ms=duration, articles_in=len(picks),
+                      relevant_count=len(picks), drafts_written=written, failure_type=failure,
+                      failure_step=failure_step, failure_detail=failure_detail)
+    except Exception:  # журнал не записався — прогін лишиться «running» у runs.db, але причина буде в логах
+        log.exception("run %s: не вдалося записати підсумок у runs.db (status=%s)", run_id, status)
     return RunSummary(run_id=run_id, status=status, started_at="", duration_ms=duration, articles_in=len(picks),
                       relevant_count=len(picks), drafts_written=written, failure_type=failure, model_version=model.version)

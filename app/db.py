@@ -39,7 +39,9 @@ CREATE TABLE IF NOT EXISTS runs (
     relevant_count INTEGER NOT NULL DEFAULT 0,
     drafts_written INTEGER NOT NULL DEFAULT 0,
     failure_type   TEXT,
-    model_version  TEXT NOT NULL
+    model_version  TEXT NOT NULL,
+    failure_step   TEXT,                      -- select | model | notion | store — де впав прогін
+    failure_detail TEXT                       -- стаття і текст помилки (до 500 символів)
 );
 CREATE TABLE IF NOT EXISTS drafts (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,6 +77,11 @@ def init_db() -> None:
         c.executescript(ARTICLES_SCHEMA)
     with _connect(RUNS_DB) as c:
         c.executescript(RUNS_SCHEMA)
+        # колонки, додані 2026-09-28: у старій runs.db на сервері їх ще немає
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(runs)")}
+        for col in ("failure_step", "failure_detail"):
+            if col not in cols:
+                c.execute(f"ALTER TABLE runs ADD COLUMN {col} TEXT")
 
 
 # ---------- articles ----------
@@ -106,12 +113,14 @@ def create_run(run_id: str, model_version: str) -> None:
 
 
 def finish_run(run_id: str, *, status: str, duration_ms: int, articles_in: int, relevant_count: int,
-               drafts_written: int, failure_type: str | None) -> None:
+               drafts_written: int, failure_type: str | None, failure_step: str | None = None,
+               failure_detail: str | None = None) -> None:
     with _connect(RUNS_DB) as c:
         c.execute(
-            "UPDATE runs SET status=?, duration_ms=?, articles_in=?, relevant_count=?, drafts_written=?, failure_type=? "
-            "WHERE run_id=?",
-            (status, duration_ms, articles_in, relevant_count, drafts_written, failure_type, run_id),
+            "UPDATE runs SET status=?, duration_ms=?, articles_in=?, relevant_count=?, drafts_written=?, failure_type=?, "
+            "failure_step=?, failure_detail=? WHERE run_id=?",
+            (status, duration_ms, articles_in, relevant_count, drafts_written, failure_type, failure_step,
+             failure_detail, run_id),
         )
 
 
