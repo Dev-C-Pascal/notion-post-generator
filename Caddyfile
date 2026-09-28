@@ -1,0 +1,4 @@
+# DOMAIN береться з .env (наприклад posts.kse.ua). Caddy сам отримує сертифікат Let's Encrypt.
+{$DOMAIN} {
+    reverse_proxy app:8000
+}
