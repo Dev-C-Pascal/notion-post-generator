@@ -65,13 +65,15 @@ ruff check app tests && mypy app && pytest -q
 ## Деплой
 
 - `ci.yml` — на кожен push: ruff, mypy, pytest, `docker build` з тегом git sha.
-- `deploy.yml` — push у `main`: SSH на EC2 → checkout sha → `IMAGE_TAG=<sha> docker compose up -d --build`
-  → smoke `/health` → при збої відкат на попередній sha. Деплой перезапускає бекенд і обриває прогони,
-  що йдуть: перед пушем перевірити `GET /runs`.
+- `deploy.yml` — push у `main`: SSH на EC2 → checkout sha → `IMAGE_TAG=<sha>` у `.env` →
+  `docker compose up -d --build` → smoke `/health` → при збої відкат на попередній sha. Коміти лише з `*.md`
+  не деплояться. Деплой перезапускає бекенд і обриває прогони, що йдуть: перед пушем перевірити `GET /runs`.
 - `cron.yml` — `POST /run` лише вручну (Actions → Run workflow); щоденний розклад вимкнено 28.09.
 
-Перезапуск на сервері вручну — лише з тегом образу, інакше compose підніме старий `post-generator:local`:
+Перезапуск на сервері вручну (тег образу поточної версії деплой пише в `.env`):
 
 ```bash
-cd ~/post-generator && IMAGE_TAG=$(git rev-parse HEAD) docker compose up -d app
+cd ~/post-generator && docker compose up -d app
 ```
+
+Бекап бази драфтів — щоночі о 01:20 UTC, `ops/backup_postgen.sh` (crontab ubuntu), дампи в `~/backups`, 14 днів.

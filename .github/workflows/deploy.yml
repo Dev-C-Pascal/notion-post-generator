@@ -2,6 +2,8 @@ name: Deploy
 on:
   push:
     branches: [main]
+    # лише документація — не перезапускаємо бекенд: деплой обриває прогони, що йдуть
+    paths-ignore: ["**.md"]
   workflow_dispatch:
     inputs:
       environment:
@@ -24,12 +26,16 @@ jobs:
             cd ~/post-generator
             PREV=$(git rev-parse HEAD)
             git fetch -q && git checkout -q ${{ github.sha }}
+            # тег образу — ще й у .env: тоді ручний `docker compose up -d app` підніме цю версію, а не старий :local
+            sed -i '/^IMAGE_TAG=/d' .env && echo "IMAGE_TAG=${{ github.sha }}" >> .env
             export IMAGE_TAG=${{ github.sha }}
             docker compose up -d --build
             sleep 5
             if ! curl -fsS --retry 5 --retry-delay 3 --retry-all-errors http://127.0.0.1:8000/health; then
               echo "smoke failed → rollback to $PREV"
-              git checkout -q $PREV && IMAGE_TAG=$PREV docker compose up -d --build
+              git checkout -q $PREV
+              sed -i '/^IMAGE_TAG=/d' .env && echo "IMAGE_TAG=$PREV" >> .env
+              IMAGE_TAG=$PREV docker compose up -d --build
               exit 1
             fi
             docker compose ps
