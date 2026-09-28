@@ -9,7 +9,10 @@ os.environ["RUNPOD_ENDPOINT_ID"] = "test"
 os.environ["RUNPOD_API_KEY"] = "test"
 os.environ["COMMS_DATABASE_URL"] = ""
 
+import asyncio  # noqa: E402
 import json  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
 
 import httpx  # noqa: E402
 import pytest  # noqa: E402
@@ -218,6 +221,49 @@ async def test_failed_run_releases_article(monkeypatch, tmp_path):
     summary = await pipeline.run_pipeline("r1", database_id="db", model=FakeModel())
     assert (summary.status, summary.failure_type) == ("failed", "ConnectTimeout")
     assert fake.released == [("a1", "r1")]  # драфт не дійшов до Notion — стаття знову вільна
+
+
+class SlowModel(FakeModel):
+    """Модель, що «генерує» 0,3 с і рахує, скільки генерацій ішло одночасно."""
+
+    def __init__(self):
+        super().__init__()
+        self.active = self.peak = 0
+        self.lock = threading.Lock()
+
+    def draft(self, article: Article, lang: str | None = None) -> Draft:
+        with self.lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+        time.sleep(0.3)
+        with self.lock:
+            self.active -= 1
+        return super().draft(article, lang)
+
+
+@pytest.mark.asyncio
+async def test_parallel_clicks_do_not_starve_notion(monkeypatch, tmp_path):
+    # 8 натискань разом: генерацій не більше MAX_PARALLEL_DRAFTS, а спільний пул потоків (DNS для Notion) вільний
+    monkeypatch.setattr(db, "RUNS_DB", tmp_path / "runs.db")
+    db.init_db()
+    FakeUsed().install(monkeypatch, [f"a{i}" for i in range(8)])
+    monkeypatch.setattr(pg, "save_draft", lambda run_id, r, status: None)
+    created = []
+
+    async def fake_create(database_id, properties, body=None):
+        created.append(body)
+        return {"id": f"page-{len(created)}"}
+
+    monkeypatch.setattr(notion, "create_row", fake_create)
+    model = SlowModel()
+    runs = asyncio.gather(*(pipeline.run_pipeline(f"r{i}", database_id="db", model=model) for i in range(8)))
+    await asyncio.sleep(0.1)  # генерації вже йдуть
+    t0 = time.monotonic()
+    await asyncio.to_thread(lambda: None)  # так само, як getaddrinfo перед з'єднанням з Notion
+    assert time.monotonic() - t0 < 0.2
+    summaries = await runs
+    assert [s.status for s in summaries] == ["ok"] * 8 and len(created) == 8
+    assert model.peak == pipeline.MAX_PARALLEL_DRAFTS
 
 
 def test_api():

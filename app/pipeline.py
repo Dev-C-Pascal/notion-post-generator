@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 from . import comms, db, notion, pg
 from .llm import ModelClient, get_model_client
@@ -21,6 +23,12 @@ STATUS = "New draft"  # новий драфт чекає на рецензент
 # канал кнопки → lang для моделі Артема: за мовою вона обирає і формат (uk — пост для FB, en — тред для X)
 CHANNEL_LANG = {"fb": "uk", "x": "en"}
 PICK_SPARE = 5  # скільки зайвих кандидатів брати на випадок, коли їх розбирають паралельні прогони
+# Модель відповідає хвилинами (runsync + опитування з time.sleep). У спільному пулі asyncio.to_thread (6 потоків
+# на 2 CPU) вона займала всі потоки, а DNS-запит до Notion чекав у тій самій черзі → ConnectTimeout уже після
+# готової генерації. Тому окремий пул: не більше MAX_PARALLEL_DRAFTS генерацій разом, решта чекає своєї черги
+# (таймаут моделі рахується з моменту, коли генерація справді почалась).
+MAX_PARALLEL_DRAFTS = int(os.environ.get("MAX_PARALLEL_DRAFTS", "3"))
+_MODEL_POOL = ThreadPoolExecutor(max_workers=MAX_PARALLEL_DRAFTS, thread_name_prefix="model")
 
 
 def new_run_id() -> str:
@@ -96,8 +104,8 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel
         picks = step_select(run_id, limit, channel)
         for a, rel in picks:
             res = DraftResult(article=a, relevance=rel)
-            # модель на RunPod відповідає хвилинами — в окремому потоці, щоб не блокувати /health і вебхуки
-            res.draft = await asyncio.to_thread(model.draft, a, lang)
+            # модель на RunPod відповідає хвилинами — у власному пулі, щоб не блокувати вебхуки й запити до Notion
+            res.draft = await asyncio.get_running_loop().run_in_executor(_MODEL_POOL, model.draft, a, lang)
             res.notion_page_id = await step_write_notion(run_id, database_id, res, channel)
             in_notion.add(str(a.id))
             if pg.enabled():
