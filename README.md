@@ -64,10 +64,11 @@ ruff check app tests && mypy app && pytest -q
 
 ## Деплой
 
-- `ci.yml` — на кожен push: ruff, mypy, pytest, `docker build` з тегом git sha.
-- `deploy.yml` — push у `main`: SSH на EC2 → checkout sha → `IMAGE_TAG=<sha>` у `.env` →
-  `docker compose up -d --build` → smoke `/health` → при збої відкат на попередній sha. Коміти лише з `*.md`
-  не деплояться. Деплой перезапускає бекенд і обриває прогони, що йдуть: перед пушем перевірити `GET /runs`.
+- `ci.yml` — на кожен push (крім комітів лише з `*.md`): ruff, mypy, pytest, `docker build` з тегом git sha.
+- `deploy.yml` — **лише після зеленого CI** на push у `main` (або вручну): SSH на EC2 → checkout того sha,
+  що пройшов CI → `IMAGE_TAG=<sha>` у `.env` → `docker compose up -d --build` → smoke `/health` → при збої відкат
+  на попередній sha. Старіший коміт поверх новішого не деплоїться; один деплой за раз. Деплой перезапускає
+  бекенд і обриває прогони, що йдуть: перед пушем перевірити `GET /runs`.
 - `cron.yml` — `POST /run` лише вручну (Actions → Run workflow); щоденний розклад вимкнено 28.09.
 
 Перезапуск на сервері вручну (тег образу поточної версії деплой пише в `.env`):
