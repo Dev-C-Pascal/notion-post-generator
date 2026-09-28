@@ -2,9 +2,10 @@
 
 Стаття для драфту — з його векторного відбору (bge-m3 + pgvector), лише з повним текстом і лише ті,
 на які ми ще не писали драфт:
-  1. топ дня (rank_daily → ml.daily_pick): останній зріз, за рангом;
-  2. якщо там порожньо — тематичний відбір (score_topics → marts.topic_queue): above_threshold, за балом.
-     Топ дня рахується довше (перший запуск — години), а теми для свіжих статей уже є.
+  1. топ дня (rank_daily → ml.daily_pick): останній зріз, за рангом — лише якщо зріз свіжий (rank_daily щогодини;
+     старий зріз означає, що відбір стоїть, і його «топ дня» — новини позавчора);
+  2. якщо там порожньо — тематичний відбір (score_topics → marts.topic_queue): above_threshold, за балом,
+     лише статті за останню добу (вікно самої черги — 3 дні, без фільтра брались новини дво-, триденної давності).
 Вмикається змінною COMMS_DATABASE_URL. Тільки SELECT — у його базу ми нічого не пишемо.
 """
 from __future__ import annotations
@@ -14,6 +15,9 @@ import os
 import psycopg
 
 from .models import Article, RelevanceResult
+
+TOP_MAX_AGE_HOURS = 3  # зріз топу дня старший за це — rank_daily не працює, беремо тематичний відбір
+FRESH_HOURS = 24  # стаття для тематичного відбору не старша за добу (як fresh_hours у ранкері Андрія)
 
 TOP_PICKS = """
     SELECT a.article_id::text, a.url_canonical, coalesce(a.title, ''), a.body_text,
@@ -25,6 +29,7 @@ TOP_PICKS = """
     LEFT JOIN core.source s ON s.source_id = a.source_id
     LEFT JOIN core.topic t ON t.topic_code = p.topic_code
     WHERE p.computed_at = (SELECT max(computed_at) FROM ml.daily_pick)
+      AND p.computed_at > now() - make_interval(hours => %s)
       AND a.retrieval_status = 'full_text' AND coalesce(a.body_text, '') <> ''
       AND a.article_id::text <> ALL(%s::text[])
     ORDER BY p.rank
@@ -42,6 +47,7 @@ TOPIC_PICKS = """
         JOIN core.article a USING (article_id)
         LEFT JOIN core.source s ON s.source_id = a.source_id
         WHERE q.above_threshold AND a.retrieval_status = 'full_text' AND coalesce(a.body_text, '') <> ''
+          AND coalesce(a.published_at, a.ingested_at) >= now() - make_interval(hours => %s)
           AND a.article_id::text <> ALL(%s::text[])
         ORDER BY q.article_id, q.score DESC
     ) x
@@ -63,14 +69,14 @@ def fetch_picks(limit: int, exclude: set[str]) -> list[tuple[Article, RelevanceR
     """Статті для драфту, крім exclude (на них драфт уже є): спершу топ дня, решта — з тематичного відбору."""
     picks = []
     for aid, url, title, text, source, published, rank, score, topic, event_size in _query(
-            TOP_PICKS, (sorted(exclude), limit)):
+            TOP_PICKS, (TOP_MAX_AGE_HOURS, sorted(exclude), limit)):
         reason = f"топ дня №{rank}, тема «{topic}», бал {score:.3f}, видань про подію: {event_size}"
         picks.append(_pick(aid, url, title, text, source, published, topic, score, reason))
     if len(picks) < limit:
         taken = exclude | {str(a.id) for a, _ in picks}
         for aid, url, title, text, source, published, topic, score in _query(
-                TOPIC_PICKS, (sorted(taken), limit - len(picks))):
-            reason = f"тематичний відбір (топ дня ще рахується): тема «{topic}», бал {score:.3f}"
+                TOPIC_PICKS, (FRESH_HOURS, sorted(taken), limit - len(picks))):
+            reason = f"тематичний відбір (у топі дня вільних статей немає): тема «{topic}», бал {score:.3f}"
             picks.append(_pick(aid, url, title, text, source, published, topic, score, reason))
     return picks
 

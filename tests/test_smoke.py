@@ -99,18 +99,21 @@ def test_picks_prefer_daily_top(monkeypatch):
     [(a, rel)] = comms.fetch_picks(1, {"old"})
     assert (a.id, a.topic) == ("a-top", "Стан економіки РФ")
     assert rel.reason.startswith("топ дня №1") and rel.score == 0.612
-    assert calls == [("top", (["old"], 1))]  # топу вистачило — тематичний відбір не чіпаємо
+    # зріз топу — лише свіжий; топу вистачило — тематичний відбір не чіпаємо
+    assert calls == [("top", (comms.TOP_MAX_AGE_HOURS, ["old"], 1))]
 
 
 def test_picks_fall_back_to_topic_queue(monkeypatch):
     calls = _fake_db(monkeypatch, [], [TOPIC_ROW])
     [(a, rel)] = comms.fetch_picks(1, {"old"})
-    assert a.id == "a-topic" and "тематичний відбір" in rel.reason and "Війна в Україні" in rel.reason
-    assert calls == [("top", (["old"], 1)), ("topic", (["old"], 1))]
+    assert a.id == "a-topic" and "Війна в Україні" in rel.reason
+    assert "у топі дня вільних статей немає" in rel.reason  # не «топ дня ще рахується»: він рахується щогодини
+    # тематичний відбір — лише статті за останню добу
+    assert calls == [("top", (comms.TOP_MAX_AGE_HOURS, ["old"], 1)), ("topic", (comms.FRESH_HOURS, ["old"], 1))]
     # топ дав менше, ніж треба: решта з тематичного, без статей, уже взятих із топу
     calls = _fake_db(monkeypatch, [TOP_ROW], [TOPIC_ROW])
     assert [a.id for a, _ in comms.fetch_picks(2, {"old"})] == ["a-top", "a-topic"]
-    assert calls[1] == ("topic", (["a-top", "old"], 1))
+    assert calls[1] == ("topic", (comms.FRESH_HOURS, ["a-top", "old"], 1))
 
 
 def _art(aid: str) -> tuple[Article, RelevanceResult]:
