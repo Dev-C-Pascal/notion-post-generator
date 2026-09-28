@@ -7,15 +7,17 @@ Score — формула в самій таблиці.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
-from . import comms, db, notion, pg
+from . import comms, db, notion, pg, status
 from .llm import ModelClient, get_model_client
-from .models import Article, DraftResult, RelevanceResult, RunSummary
+from .models import Article, Draft, DraftResult, RelevanceResult, RunSummary
 
 log = logging.getLogger("pipeline")
 
@@ -29,6 +31,13 @@ PICK_SPARE = 5  # скільки зайвих кандидатів брати н
 # (таймаут моделі рахується з моменту, коли генерація справді почалась).
 MAX_PARALLEL_DRAFTS = int(os.environ.get("MAX_PARALLEL_DRAFTS", "3"))
 _MODEL_POOL = ThreadPoolExecutor(max_workers=MAX_PARALLEL_DRAFTS, thread_name_prefix="model")
+_in_pool = 0  # скільки прогонів зараз у пулі моделі (генерують або чекають) — для «у черзі» в рядку статусу
+
+
+def _draft(model: ModelClient, article: Article, lang: str | None, on_start: Callable[[], object]) -> Draft:
+    """У потоці пулу: повідомити, що генерація справді почалась (черга позаду), і генерувати."""
+    on_start()
+    return model.draft(article, lang)
 
 
 def new_run_id() -> str:
@@ -92,9 +101,12 @@ async def step_write_notion(run_id: str, database_id: str, r: DraftResult, chann
 async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel: str | None = None,
                        model: ModelClient | None = None) -> RunSummary:
     """channel — fb | x | None (мова поста = мова статті)."""
+    global _in_pool
     model = model or get_model_client()
     lang = CHANNEL_LANG[channel] if channel else None
     t0 = time.monotonic()
+    started = status.now()  # час натискання — ним рядок прогону підписаний у блоці статусу
+    status.report(run_id, channel, started, "шукаю статтю…")
     db.create_run(run_id, model.version)
     picks: list[tuple[Article, RelevanceResult]] = []
     in_notion: set[str] = set()  # статті, чий драфт уже в Notion: бронь із них не знімаємо
@@ -103,17 +115,32 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel
     step, current = "select", None  # для діагностики: на якому кроці і з якою статтею впав прогін
     failure_step: str | None = None
     failure_detail: str | None = None
+    loop = asyncio.get_running_loop()
     try:
         picks = step_select(run_id, limit, channel)
+        if not picks:
+            status.report(run_id, channel, started, "немає свіжих статей — спробуйте пізніше")
         for a, rel in picks:
             current = a
             res = DraftResult(article=a, relevance=rel)
             step = "model"
+            if _in_pool >= MAX_PARALLEL_DRAFTS:
+                status.report(run_id, channel, started, "у черзі", title=a.title,
+                              note=f"(вже йдуть {MAX_PARALLEL_DRAFTS} генерації)")
+            on_start = functools.partial(loop.call_soon_threadsafe, functools.partial(
+                status.report, run_id, channel, started, "генерується", title=a.title, note="(зазвичай 3–5 хв)"))
             # модель на RunPod відповідає хвилинами — у власному пулі, щоб не блокувати вебхуки й запити до Notion
-            res.draft = await asyncio.get_running_loop().run_in_executor(_MODEL_POOL, model.draft, a, lang)
+            _in_pool += 1
+            try:
+                draft = await loop.run_in_executor(_MODEL_POOL, _draft, model, a, lang, on_start)
+            finally:
+                _in_pool -= 1
+            res.draft = draft
             step = "notion"
             res.notion_page_id = await step_write_notion(run_id, database_id, res, channel)
             in_notion.add(str(a.id))
+            status.report(run_id, channel, started, "готово", title=a.title, url=status.page_url(res.notion_page_id),
+                          note="→ у таблиці MVP")
             step = "store"
             if pg.enabled():
                 pg.save_draft(run_id, res, STATUS)
@@ -121,24 +148,27 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel
             db.upsert_draft(
                 run_id=run_id, article_id=a.id, notion_page_id=res.notion_page_id,
                 relevance=rel.relevant, reason=rel.reason, score=rel.score, extraction=None,
-                headline=res.draft.headline, draft_text=res.draft.text, failure_type=None,
+                headline=draft.headline, draft_text=draft.text, failure_type=None,
                 model_version=model.version,
             )
-        status = "ok"
+        outcome = "ok"
     except Exception as e:
         log.exception("run %s failed at %s", run_id, step)
-        status, failure, failure_step = "failed", type(e).__name__, step
+        outcome, failure, failure_step = "failed", type(e).__name__, step
         # текст помилки (для моделі — з id задачі RunPod), а не лише назва класу
         failure_detail = (f"article {current.id} ({current.url}): " if current else "") + str(e)
         failure_detail = failure_detail[:500]
         if pg.enabled():
             release_unwritten(run_id, picks, in_notion)
+        if not (current and str(current.id) in in_notion):  # драфт уже в таблиці — лишаємо «готово»
+            status.report(run_id, channel, started, f"не вдалося ({step})", title=current.title if current else None,
+                          note="— стаття знову в черзі, натисніть ще раз" if current else "— натисніть ще раз пізніше")
     duration = int((time.monotonic() - t0) * 1000)
     try:
-        db.finish_run(run_id, status=status, duration_ms=duration, articles_in=len(picks),
+        db.finish_run(run_id, status=outcome, duration_ms=duration, articles_in=len(picks),
                       relevant_count=len(picks), drafts_written=written, failure_type=failure,
                       failure_step=failure_step, failure_detail=failure_detail)
     except Exception:  # журнал не записався — прогін лишиться «running» у runs.db, але причина буде в логах
-        log.exception("run %s: не вдалося записати підсумок у runs.db (status=%s)", run_id, status)
-    return RunSummary(run_id=run_id, status=status, started_at="", duration_ms=duration, articles_in=len(picks),
+        log.exception("run %s: не вдалося записати підсумок у runs.db (status=%s)", run_id, outcome)
+    return RunSummary(run_id=run_id, status=outcome, started_at="", duration_ms=duration, articles_in=len(picks),
                       relevant_count=len(picks), drafts_written=written, failure_type=failure, model_version=model.version)

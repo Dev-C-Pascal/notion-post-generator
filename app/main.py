@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import db, notion, pg, pipeline
+from . import db, notion, pg, pipeline, status
 from .llm import get_model_client
 
 load_dotenv()
@@ -35,7 +35,7 @@ app = FastAPI(title="Post generator (MLOps prototype)")
 
 
 @app.on_event("startup")
-def _startup() -> None:
+async def _startup() -> None:
     if WEBHOOK_SECRET in WEAK_SECRETS:
         raise RuntimeError("WEBHOOK_SECRET порожній або стандартний (change-me) — згенерувати: openssl rand -hex 24")
     db.init_db()
@@ -43,6 +43,7 @@ def _startup() -> None:
         pg.init_db()
         log.info("drafts Postgres ready")
     log.info("DBs ready: %s, %s; target Notion DB=%s", db.ARTICLES_DB, db.RUNS_DB, DATABASE_ID)
+    status.restarted()  # у блоці статусу міг лишитись «генерується» від обірваних прогонів
 
 
 @app.get("/health")

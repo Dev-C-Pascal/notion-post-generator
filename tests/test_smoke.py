@@ -18,7 +18,7 @@ import httpx  # noqa: E402
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app import comms, db, main, notion, pg, pipeline  # noqa: E402
+from app import comms, db, main, notion, pg, pipeline, status  # noqa: E402
 from app.llm import ModelError, RunPodModelClient, detect_lang, get_model_client  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Article, Draft, RelevanceResult  # noqa: E402
@@ -298,6 +298,80 @@ async def test_parallel_clicks_do_not_starve_notion(monkeypatch, tmp_path):
     summaries = await runs
     assert [s.status for s in summaries] == ["ok"] * 8 and len(created) == 8
     assert model.peak == pipeline.MAX_PARALLEL_DRAFTS
+
+
+def _board(monkeypatch, tmp_path, feed: list[str]) -> list:
+    """Рядок статусу ввімкнено, Notion-блок підмінено: повертає список надісланих оновлень блоку."""
+    monkeypatch.setenv("NOTION_STATUS_BLOCK_ID", "blk")
+    monkeypatch.setattr(status, "_lines", {})
+    monkeypatch.setattr(status, "_pending", False)
+    monkeypatch.setattr(status, "_lock", None)  # замок прив'язується до event loop, а в кожного тесту свій
+    sent: list = []
+
+    async def fake_update_block(block_id, payload):
+        sent.append((block_id, payload))
+        return {}
+
+    monkeypatch.setattr(notion, "update_block", fake_update_block)
+    monkeypatch.setattr(db, "RUNS_DB", tmp_path / "runs.db")
+    db.init_db()
+    FakeUsed().install(monkeypatch, feed)
+    monkeypatch.setattr(pg, "save_draft", lambda run_id, r, st: None)
+    return sent
+
+
+def _board_lines(payload: dict) -> list[str]:
+    text = "".join(s["text"]["content"] for s in payload["callout"]["rich_text"])
+    return text.split("\n")[1:]  # перший рядок — заголовок
+
+
+@pytest.mark.asyncio
+async def test_status_board_follows_each_click(monkeypatch, tmp_path):
+    sent = _board(monkeypatch, tmp_path, ["a1"])
+
+    async def fake_create(database_id, properties, body=None):
+        return {"id": "page-1"}
+
+    monkeypatch.setattr(notion, "create_row", fake_create)
+    await pipeline.run_pipeline("r1", database_id="db", channel="fb", model=FakeModel())
+    await pipeline.run_pipeline("r2", database_id="db", channel="x", model=FakeModel())  # статей більше немає
+    await status.drain()
+    block_id, payload = sent[-1]
+    lines = _board_lines(payload)
+    assert block_id == "blk" and len(lines) == 2
+    assert "X — немає свіжих статей" in lines[0]  # новіші зверху
+    assert "FB — готово: «T» → у таблиці MVP" in lines[1]
+    [link] = [s["text"]["link"]["url"] for s in payload["callout"]["rich_text"] if s["text"].get("link")]
+    assert link == "https://www.notion.so/page1"  # назва — посилання на рядок драфту
+
+
+@pytest.mark.asyncio
+async def test_status_board_reports_failure_and_restart(monkeypatch, tmp_path):
+    sent = _board(monkeypatch, tmp_path, ["a1"])
+
+    async def notion_down(database_id, properties, body=None):
+        raise RuntimeError("Notion 400: validation_error")
+
+    monkeypatch.setattr(notion, "create_row", notion_down)
+    await pipeline.run_pipeline("r1", database_id="db", channel="fb", model=FakeModel())
+    await status.drain()
+    [line] = _board_lines(sent[-1][1])
+    assert "FB — не вдалося (notion): «T» — стаття знову в черзі, натисніть ще раз" in line
+    status.restarted()  # після перезапуску бекенду «генерується» не висить
+    await status.drain()
+    [line] = _board_lines(sent[-1][1])
+    assert "бекенд перезапущено" in line
+
+
+@pytest.mark.asyncio
+async def test_status_board_coalesces_bursts(monkeypatch, tmp_path):
+    sent = _board(monkeypatch, tmp_path, [])
+    for i in range(20):
+        status.report(f"r{i}", "fb", "12:00", f"подія {i}")
+    await status.drain()
+    assert len(sent) == 1  # 20 подій поспіль — одне оновлення блоку, а не 20 (ліміт Notion ~3 запити/с)
+    lines = _board_lines(sent[-1][1])
+    assert len(lines) == status.MAX_LINES and "подія 19" in lines[0] and "подія 15" in lines[-1]
 
 
 def test_api():

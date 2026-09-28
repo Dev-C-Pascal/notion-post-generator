@@ -119,6 +119,12 @@ async def append_body(page_id: str, body: str) -> dict:
                            json={"children": _paragraphs(body)})
 
 
+async def update_block(block_id: str, payload: dict) -> dict:
+    """PATCH /v1/blocks/{id} — переписати вміст блоку (напр. {"callout": {"rich_text": [...]}})."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        return await _send(client, "PATCH", f"{NOTION_API}/blocks/{block_id}", json=payload)
+
+
 async def update_row(page_id: str, properties: dict) -> dict:
     """PATCH /v1/pages/{id} — оновити властивості існуючого рядка."""
     async with httpx.AsyncClient(timeout=30) as client:

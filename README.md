@@ -36,6 +36,7 @@ app/comms.py     читання статей з бази Андрія (топ д
 app/llm.py       ModelClient + RunPodModelClient (runsync, опитування статусу, скасування через 10 хв)
 app/notion.py    Notion REST API 2022-06-28: створення рядка, тіло сторінки частинами по 100 блоків
 app/pg.py        Postgres postgen: drafts, draft_versions, used_articles, sync_state
+app/status.py    рядок статусу під кнопками в Notion: шукаю статтю → у черзі → генерується → готово / не вдалося
 app/db.py        SQLite runs.db: журнал прогонів
 app/models.py    pydantic-моделі кроків
 tests/           unit, e2e з mock-Notion, API
@@ -49,6 +50,7 @@ tests/           unit, e2e з mock-Notion, API
 |---|---|
 | `NOTION_TOKEN`, `NOTION_DATABASE_ID` | інтеграція Notion і таблиця MVP |
 | `NOTION_PROP_DRAFT/SOURCE/STATUS` | назви колонок, якщо їх перейменують |
+| `NOTION_STATUS_BLOCK_ID` | callout під кнопками: що з кожним натисканням (`app/status.py`); не задано — вимкнено |
 | `WEBHOOK_SECRET` | має збігатися із заголовком `x-webhook-secret` у кнопках |
 | `COMMS_DATABASE_URL` | база статей Андрія (без неї статей немає) |
 | `POSTGEN_DB_PASSWORD` | наша база драфтів (сервіс `db` у compose) |
