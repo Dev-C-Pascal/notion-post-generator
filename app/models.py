@@ -27,6 +27,9 @@ class Draft(BaseModel):
     text: str
     model_version: str
     lang: str  # мова поста, яку попросили в моделі: uk | en
+    # mode=draft_grounded: факти, з яких написано пост ({"claim", "verbatim_quote"}), і ті, що не пройшли перевірку
+    facts_used: list[dict] = []
+    facts_rejected: list[dict] = []
 
 
 class DraftResult(BaseModel):

@@ -16,7 +16,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 from . import comms, db, notion, pg, status
-from .llm import ModelClient, get_model_client
+from .llm import GroundingRefused, ModelClient, get_model_client
 from .models import Article, Draft, DraftResult, RelevanceResult, RunSummary
 
 log = logging.getLogger("pipeline")
@@ -32,6 +32,9 @@ PICK_SPARE = 5  # скільки зайвих кандидатів брати н
 MAX_PARALLEL_DRAFTS = int(os.environ.get("MAX_PARALLEL_DRAFTS", "3"))
 _MODEL_POOL = ThreadPoolExecutor(max_workers=MAX_PARALLEL_DRAFTS, thread_name_prefix="model")
 _in_pool = 0  # скільки прогонів зараз у пулі моделі (генерують або чекають) — для «у черзі» в рядку статусу
+# mode=draft_grounded може відмовитись від статті (немає фактів, підтверджених цитатою) — тоді в тому ж прогоні
+# беремо наступну, але не більше MAX_REFUSALS разів: кожна спроба — це виклик моделі
+MAX_REFUSALS = 2
 
 
 def _draft(model: ModelClient, article: Article, lang: str | None, on_start: Callable[[], object]) -> Draft:
@@ -94,8 +97,21 @@ async def step_write_notion(run_id: str, database_id: str, r: DraftResult, chann
     if existing:
         await notion.update_row(existing, props)
         return existing
-    page = await notion.create_row(database_id, props, body=body)
+    # draft_grounded: під постом — факти з цитатами зі статті, щоб рецензент перевіряв Fact safety за хвилину
+    facts = []
+    if r.draft.facts_used:
+        facts.append(notion.toggle(f"Факти, з яких написано пост ({len(r.draft.facts_used)}) — кожен підтверджено "
+                                   "цитатою зі статті", [_fact_line(f) for f in r.draft.facts_used]))
+    if r.draft.facts_rejected:
+        facts.append(notion.toggle(f"Відкинуті факти ({len(r.draft.facts_rejected)}) — цитату в статті не знайдено, "
+                                   "у пост не пішли", [_fact_line(f) for f in r.draft.facts_rejected]))
+    page = await notion.create_row(database_id, props, body=body, extra_blocks=facts)
     return page["id"]
+
+
+def _fact_line(f: dict) -> str:
+    claim, quote = f.get("claim"), f.get("verbatim_quote")
+    return f"{claim} — «{quote}»" if claim and quote else str(claim or quote or f)
 
 
 async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel: str | None = None,
@@ -110,6 +126,7 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel
     db.create_run(run_id, model.version)
     picks: list[tuple[Article, RelevanceResult]] = []
     in_notion: set[str] = set()  # статті, чий драфт уже в Notion: бронь із них не знімаємо
+    refused: set[str] = set()  # статті, від яких модель відмовилась: бронь теж лишаємо — вдруге брати марно
     written = 0
     failure: str | None = None
     step, current = "select", None  # для діагностики: на якому кроці і з якою статтею впав прогін
@@ -120,7 +137,9 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel
         picks = step_select(run_id, limit, channel)
         if not picks:
             status.report(run_id, channel, started, "немає свіжих статей — спробуйте пізніше")
-        for a, rel in picks:
+        queue = list(picks)
+        while queue:
+            a, rel = queue.pop(0)
             current = a
             res = DraftResult(article=a, relevance=rel)
             step = "model"
@@ -133,6 +152,18 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel
             _in_pool += 1
             try:
                 draft = await loop.run_in_executor(_MODEL_POOL, _draft, model, a, lang, on_start)
+            except GroundingRefused as e:
+                refused.add(str(a.id))
+                log.warning("run %s: модель відмовилась від статті %s (%s): %s", run_id, a.id, a.url, e)
+                if len(refused) > MAX_REFUSALS:
+                    raise
+                more = step_select(run_id, 1, channel)  # замість неї — наступна стаття в тому ж прогоні
+                status.report(run_id, channel, started, "модель відмовилась", title=a.title,
+                              note="(немає фактів, які вона змогла підтвердити) — "
+                                   + ("беру наступну статтю" if more else "інших свіжих статей немає"))
+                picks += more
+                queue += more
+                continue
             finally:
                 _in_pool -= 1
             res.draft = draft
@@ -151,6 +182,8 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel
                 headline=draft.headline, draft_text=draft.text, failure_type=None,
                 model_version=model.version,
             )
+        if refused and not written:  # модель відмовилась від усіх статей, а нових немає — драфту не буде
+            raise GroundingRefused(f"модель відмовилась від {len(refused)} статей, інших свіжих немає")
         outcome = "ok"
     except Exception as e:
         log.exception("run %s failed at %s", run_id, step)
@@ -159,8 +192,12 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel
         failure_detail = (f"article {current.id} ({current.url}): " if current else "") + str(e)
         failure_detail = failure_detail[:500]
         if pg.enabled():
-            release_unwritten(run_id, picks, in_notion)
-        if not (current and str(current.id) in in_notion):  # драфт уже в таблиці — лишаємо «готово»
+            release_unwritten(run_id, picks, in_notion | refused)
+        if isinstance(e, GroundingRefused):
+            status.report(run_id, channel, started, "модель відмовилась", title=current.title if current else None,
+                          note=f"від {len(refused)} статей поспіль (немає фактів, які вона змогла підтвердити) — "
+                               "натисніть ще раз пізніше")
+        elif not (current and str(current.id) in in_notion):  # драфт уже в таблиці — лишаємо «готово»
             status.report(run_id, channel, started, f"не вдалося ({step})", title=current.title if current else None,
                           note="— стаття знову в черзі, натисніть ще раз" if current else "— натисніть ще раз пізніше")
     duration = int((time.monotonic() - t0) * 1000)

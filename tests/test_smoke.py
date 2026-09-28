@@ -19,7 +19,7 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app import comms, db, main, notion, pg, pipeline, status  # noqa: E402
-from app.llm import ModelError, RunPodModelClient, detect_lang, get_model_client  # noqa: E402
+from app.llm import GroundingRefused, ModelError, RunPodModelClient, detect_lang, get_model_client  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Article, Draft, RelevanceResult  # noqa: E402
 
@@ -48,14 +48,35 @@ def _runpod(responses: list[dict], sent: list) -> RunPodModelClient:
     return RunPodModelClient("ep1", "key", poll_s=0, transport=httpx.MockTransport(handler))
 
 
+FACT = {"claim": "Vyriy unveiled Slavic.", "verbatim_quote": "Vyriy Industries has unveiled Slavic"}
+
+
 def test_runpod_draft_waits_for_cold_start():
     sent: list = []
     m = _runpod([{"id": "j1", "status": "IN_QUEUE"}, {"id": "j1", "status": "IN_PROGRESS"},
-                 {"id": "j1", "status": "COMPLETED", "output": {"post": " Пост 1/\n\nПост 2/ "}}], sent)
+                 {"id": "j1", "status": "COMPLETED", "output": {"post": " Пост 1/\n\nПост 2/ ", "facts_used": [FACT],
+                                                              "facts_rejected": [], "raw_extraction_output": "[…]"}}],
+                sent)
     d = m.draft(ART)
-    assert (d.headline, d.text, d.model_version, d.lang) == (ART.title, "Пост 1/\n\nПост 2/", "runpod-ep1", "uk")
-    assert sent[0] == ("POST", "/v2/ep1/runsync", {"input": {"article_text": ART.text, "lang": "uk"}})
+    assert (d.headline, d.text, d.lang) == (ART.title, "Пост 1/\n\nПост 2/", "uk")
+    assert d.model_version == "runpod-ep1:draft_grounded"  # режим у версії: оцінки до і після не змішуються
+    assert (d.facts_used, d.facts_rejected) == ([FACT], [])
+    assert sent[0] == ("POST", "/v2/ep1/runsync",
+                       {"input": {"article_text": ART.text, "lang": "uk", "mode": "draft_grounded"}})
     assert [s[1] for s in sent[1:]] == ["/v2/ep1/status/j1"] * 2
+
+
+@pytest.mark.parametrize("job", [
+    # так відповів ендпоінт 29.09 на текст без фактів
+    {"id": "j4", "status": "FAILED", "error": "Extraction returned no parseable facts; refusing to draft.",
+     "output": {"raw_extraction_output": "[]"}},
+    # так описав Артем: факти є, але жоден не підтверджено цитатою
+    {"id": "j5", "status": "COMPLETED",
+     "output": {"error": "No extracted facts are grounded in the article; refusing to draft."}},
+])
+def test_runpod_grounding_refusal(job):
+    with pytest.raises(GroundingRefused, match="refusing to draft"):
+        _runpod([job], []).draft(ART)
 
 
 def test_runpod_lang_from_channel_overrides_article():
@@ -67,12 +88,18 @@ def test_runpod_lang_from_channel_overrides_article():
 
 def test_runpod_failed_job_raises():
     m = _runpod([{"id": "j2", "status": "FAILED", "error": "CUDA OOM"}], [])
-    with pytest.raises(ModelError, match="CUDA OOM"):
+    with pytest.raises(ModelError, match="CUDA OOM") as e:
         m.draft(ART)
+    assert not isinstance(e.value, GroundingRefused)  # звичайний збій: статтю можна брати знову
+    # output.error без відмови — теж збій, такий пост не постимо
+    with pytest.raises(ModelError, match="boom"):
+        _runpod([{"id": "j6", "status": "COMPLETED", "output": {"error": "boom", "post": "x"}}], []).draft(ART)
 
 
 def test_model_client_requires_runpod(monkeypatch):
-    assert get_model_client().version == "runpod-test"
+    assert get_model_client().version == "runpod-test:draft_grounded"
+    monkeypatch.setenv("RUNPOD_MODE", "draft")  # повернути старий режим без зміни коду
+    assert get_model_client().version == "runpod-test:draft"
     monkeypatch.delenv("RUNPOD_API_KEY")
     with pytest.raises(RuntimeError):
         get_model_client()
@@ -176,7 +203,7 @@ async def test_e2e_with_mock_notion(monkeypatch, tmp_path):
     monkeypatch.setattr(db, "RUNS_DB", tmp_path / "runs.db")
     created = []
 
-    async def fake_create(database_id, properties, body=None):
+    async def fake_create(database_id, properties, body=None, extra_blocks=None):
         created.append((properties, body))
         return {"id": f"page-{len(created)}"}
 
@@ -217,7 +244,7 @@ async def test_failed_run_releases_article(monkeypatch, tmp_path):
     fake = FakeUsed()
     fake.install(monkeypatch, ["a1"])
 
-    async def notion_down(database_id, properties, body=None):
+    async def notion_down(database_id, properties, body=None, extra_blocks=None):
         raise httpx.ConnectTimeout("notion")
 
     monkeypatch.setattr(notion, "create_row", notion_down)
@@ -257,6 +284,66 @@ async def test_notion_retries_only_when_request_did_not_happen(monkeypatch):
     assert sent == ["POST"]
 
 
+class RefusingModel(FakeModel):
+    """draft_grounded: відмовляється від статей зі списку, решту пише з фактами."""
+
+    def __init__(self, refuse: set[str]):
+        super().__init__()
+        self.refuse, self.asked = refuse, []
+
+    def draft(self, article: Article, lang: str | None = None) -> Draft:
+        self.asked.append(article.id)
+        if article.id in self.refuse:
+            raise GroundingRefused("RunPod job j: Extraction returned no parseable facts; refusing to draft.")
+        return super().draft(article, lang).model_copy(update={
+            "facts_used": [FACT], "facts_rejected": [{"claim": "Slavic costs $1M.", "verbatim_quote": "costs $1M"}]})
+
+
+@pytest.mark.asyncio
+async def test_refused_article_is_skipped_not_retried(monkeypatch, tmp_path):
+    monkeypatch.setattr(db, "RUNS_DB", tmp_path / "runs.db")
+    db.init_db()
+    fake = FakeUsed()
+    fake.install(monkeypatch, ["a1", "a2"])
+    saved: list = []
+    monkeypatch.setattr(pg, "save_draft", lambda run_id, r, st: saved.append(r.draft))
+    created: list = []
+
+    async def fake_create(database_id, properties, body=None, extra_blocks=None):
+        created.append((properties, extra_blocks))
+        return {"id": "page-1"}
+
+    monkeypatch.setattr(notion, "create_row", fake_create)
+    model = RefusingModel({"a1"})
+    summary = await pipeline.run_pipeline("r1", database_id="db", channel="fb", model=model)
+    # a1 — відмова, у тому ж прогоні взято a2; a1 лишається «використаною» (бронь не знято) — вдруге її не візьмуть
+    assert (summary.status, summary.drafts_written, model.asked) == ("ok", 1, ["a1", "a2"])
+    assert fake.released == [] and fake.used["a1"] == "r1"
+    # під постом — згорнуті блоки з підтвердженими й відкинутими фактами; факти пішли і в postgen
+    toggles = created[0][1]
+    assert [t["toggle"]["rich_text"][0]["text"]["content"][:25] for t in toggles] == [
+        "Факти, з яких написано по", "Відкинуті факти (1) — цит"]
+    item = toggles[0]["toggle"]["children"][0]["bulleted_list_item"]["rich_text"][0]["text"]["content"]
+    assert item == "Vyriy unveiled Slavic. — «Vyriy Industries has unveiled Slavic»"
+    assert saved[0].facts_used == [FACT]
+
+
+@pytest.mark.asyncio
+async def test_run_gives_up_after_max_refusals(monkeypatch, tmp_path):
+    monkeypatch.setattr(db, "RUNS_DB", tmp_path / "runs.db")
+    db.init_db()
+    fake = FakeUsed()
+    feed = ["a1", "a2", "a3", "a4"]
+    fake.install(monkeypatch, feed)
+    model = RefusingModel(set(feed))
+    summary = await pipeline.run_pipeline("r1", database_id="db", model=model)
+    # 1 + MAX_REFUSALS спроб, далі — збій; жодну з відхилених статей не повертаємо в чергу
+    assert model.asked == feed[:pipeline.MAX_REFUSALS + 1]
+    assert (summary.status, summary.failure_type, fake.released) == ("failed", "GroundingRefused", [])
+    run = db.get_run("r1")
+    assert run and run["failure_step"] == "model"
+
+
 class SlowModel(FakeModel):
     """Модель, що «генерує» 0,3 с і рахує, скільки генерацій ішло одночасно."""
 
@@ -284,7 +371,7 @@ async def test_parallel_clicks_do_not_starve_notion(monkeypatch, tmp_path):
     monkeypatch.setattr(pg, "save_draft", lambda run_id, r, status: None)
     created = []
 
-    async def fake_create(database_id, properties, body=None):
+    async def fake_create(database_id, properties, body=None, extra_blocks=None):
         created.append(body)
         return {"id": f"page-{len(created)}"}
 
@@ -329,7 +416,7 @@ def _board_lines(payload: dict) -> list[str]:
 async def test_status_board_follows_each_click(monkeypatch, tmp_path):
     sent = _board(monkeypatch, tmp_path, ["a1"])
 
-    async def fake_create(database_id, properties, body=None):
+    async def fake_create(database_id, properties, body=None, extra_blocks=None):
         return {"id": "page-1"}
 
     monkeypatch.setattr(notion, "create_row", fake_create)
@@ -349,7 +436,7 @@ async def test_status_board_follows_each_click(monkeypatch, tmp_path):
 async def test_status_board_reports_failure_and_restart(monkeypatch, tmp_path):
     sent = _board(monkeypatch, tmp_path, ["a1"])
 
-    async def notion_down(database_id, properties, body=None):
+    async def notion_down(database_id, properties, body=None, extra_blocks=None):
         raise RuntimeError("Notion 400: validation_error")
 
     monkeypatch.setattr(notion, "create_row", notion_down)
@@ -376,7 +463,7 @@ async def test_status_board_coalesces_bursts(monkeypatch, tmp_path):
 
 def test_api():
     with TestClient(app) as c:
-        assert c.get("/health").json()["model"] == "runpod-test"
+        assert c.get("/health").json()["model"] == "runpod-test:draft_grounded"
         assert c.post("/webhook", json={"data": {"object": "page", "id": "x"}}).status_code == 401
         r = c.post("/run", headers={"x-webhook-secret": "t"})
         assert r.status_code == 202 and "run_id" in r.json()

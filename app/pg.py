@@ -95,17 +95,22 @@ def content_hash(headline: str, text: str, status: str | None) -> str:
 
 def save_draft(run_id: str, r: DraftResult, status: str) -> None:
     """Драфт + його перша версія (те, що бекенд відправив у Notion).
-    extraction / quality_score / failure_type лишаються NULL: цих кроків більше немає, оцінює людина."""
+    extraction — факти mode=draft_grounded ({"facts_used", "facts_rejected"}); у старого режиму NULL.
+    quality_score / failure_type лишаються NULL: оцінює людина."""
     assert r.draft
+    facts = {"facts_used": r.draft.facts_used, "facts_rejected": r.draft.facts_rejected}
+    extraction = json.dumps(facts, ensure_ascii=False) if any(facts.values()) else None
     with _connect() as c:
         c.execute(
             """INSERT INTO drafts (run_id, article_id, article_url, article_title, relevant, relevance_score, reason,
-                                   headline, text, model_version, notion_page_id)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                   headline, text, model_version, notion_page_id, extraction)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
                ON CONFLICT (run_id, article_id) DO UPDATE SET
-                 headline = excluded.headline, text = excluded.text, notion_page_id = excluded.notion_page_id""",
+                 headline = excluded.headline, text = excluded.text, notion_page_id = excluded.notion_page_id,
+                 extraction = excluded.extraction""",
             (run_id, str(r.article.id), r.article.url, r.article.title, r.relevance.relevant, r.relevance.score,
-             r.relevance.reason, r.draft.headline, r.draft.text, r.draft.model_version, r.notion_page_id),
+             r.relevance.reason, r.draft.headline, r.draft.text, r.draft.model_version, r.notion_page_id,
+             extraction),
         )
         if r.notion_page_id:
             _add_version(c, r.notion_page_id, r.draft.headline, r.draft.text, status, None, None)

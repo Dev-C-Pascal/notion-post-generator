@@ -18,7 +18,10 @@ FastAPI (EC2, Docker, Caddy TLS) → у фоні pipeline.run_pipeline:
   1. select  стаття з відбору Андрія (база comms, лише SELECT), з повним текстом і ще не взята:
              топ дня (ml.daily_pick) → якщо порожньо, тематична черга (marts.topic_queue).
              Стаття бронюється в postgen.used_articles ДО генерації — двічі не береться.
-  2. draft   модель на RunPod Serverless: lang = uk (FB) | en (X), 2–5 хв
+  2. draft   модель на RunPod Serverless, mode=draft_grounded: витягує факти, кожен перевіряє дослівною
+             цитатою зі статті й пише пост лише з підтверджених; lang = uk (FB) | en (X), 3–5 хв.
+             Відмова («немає підтверджених фактів») → стаття лишається використаною, береться наступна
+             (не більше 2 разів); факти — у згорнутих блоках під постом і в postgen.drafts.extraction
   3. notion  рядок у таблиці MVP: Draft, Source, Status = «New draft»; тіло — run_id · модель · канал + пост
   4. store   postgen: drafts + draft_versions (v1); runs.db: журнал прогону
   збій → бронь знімається, стаття повертається в чергу
@@ -33,7 +36,8 @@ FastAPI (EC2, Docker, Caddy TLS) → у фоні pipeline.run_pipeline:
 app/main.py      FastAPI: POST /webhook, /webhook/{fb|x}, /run; GET /health, /notion/check, /runs, /runs/{id}, /articles
 app/pipeline.py  прогін: select → draft → notion → store; канал → мова
 app/comms.py     читання статей з бази Андрія (топ дня, тематична черга)
-app/llm.py       ModelClient + RunPodModelClient (runsync, опитування статусу, скасування через 10 хв)
+app/llm.py       ModelClient + RunPodModelClient (runsync, опитування статусу, скасування через 10 хв,
+                 mode, факти, GroundingRefused)
 app/notion.py    Notion REST API 2022-06-28: створення рядка, тіло сторінки частинами по 100 блоків
 app/pg.py        Postgres postgen: drafts, draft_versions, used_articles, sync_state
 app/status.py    рядок статусу під кнопками в Notion: шукаю статтю → у черзі → генерується → готово / не вдалося
@@ -55,6 +59,7 @@ tests/           unit, e2e з mock-Notion, API
 | `COMMS_DATABASE_URL` | база статей Андрія (без неї статей немає) |
 | `POSTGEN_DB_PASSWORD` | наша база драфтів (сервіс `db` у compose) |
 | `RUNPOD_ENDPOINT_ID`, `RUNPOD_API_KEY` | модель; без них `/health` = 500 і деплой відкочується |
+| `RUNPOD_MODE` | `draft_grounded` (за замовчуванням) — пост лише з фактів, підтверджених цитатою; `draft` — старий режим |
 
 ## Локально
 

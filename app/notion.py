@@ -98,10 +98,19 @@ def _paragraphs(text: str) -> list:
             for par in text.split("\n\n") if par.strip()]
 
 
-async def create_row(database_id: str, properties: dict, body: str | None = None) -> dict:
-    """POST /v1/pages — новий рядок у таблиці; body (якщо є) стає контентом сторінки рядка."""
+def toggle(title: str, items: list[str]) -> dict:
+    """Згорнутий блок: заголовок і список пунктів (до 100 — ліміт Notion на дочірні блоки в одному запиті)."""
+    return {"object": "block", "type": "toggle", "toggle": {"rich_text": _rich(title), "children": [
+        {"object": "block", "type": "bulleted_list_item", "bulleted_list_item": {"rich_text": _rich(i)}}
+        for i in items[:BLOCKS_LIMIT]]}}
+
+
+async def create_row(database_id: str, properties: dict, body: str | None = None,
+                     extra_blocks: list[dict] | None = None) -> dict:
+    """POST /v1/pages — новий рядок у таблиці; body (якщо є) стає контентом сторінки рядка,
+    extra_blocks (напр. toggle з фактами) — після нього."""
     payload: dict = {"parent": {"database_id": database_id}, "properties": properties}
-    blocks = _paragraphs(body) if body else []
+    blocks = (_paragraphs(body) if body else []) + (extra_blocks or [])
     if blocks:
         payload["children"] = blocks[:BLOCKS_LIMIT]
     async with httpx.AsyncClient(timeout=30) as client:
