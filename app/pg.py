@@ -95,10 +95,11 @@ def content_hash(headline: str, text: str, status: str | None) -> str:
 
 def save_draft(run_id: str, r: DraftResult, status: str) -> None:
     """Драфт + його перша версія (те, що бекенд відправив у Notion).
-    extraction — факти mode=draft_grounded ({"facts_used", "facts_rejected"}); у старого режиму NULL.
+    extraction — що повернув mode=draft_grounded: facts_used, facts_rejected, status (ok / needs_manual_review),
+    regenerated, trusted_source, verification, draft_reasoning; у старого режиму NULL.
     quality_score / failure_type лишаються NULL: оцінює людина."""
     assert r.draft
-    facts = {"facts_used": r.draft.facts_used, "facts_rejected": r.draft.facts_rejected}
+    facts = {"facts_used": r.draft.facts_used, "facts_rejected": r.draft.facts_rejected, **r.draft.review}
     extraction = json.dumps(facts, ensure_ascii=False) if any(facts.values()) else None
     with _connect() as c:
         c.execute(

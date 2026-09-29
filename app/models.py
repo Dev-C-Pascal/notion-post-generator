@@ -30,6 +30,10 @@ class Draft(BaseModel):
     # mode=draft_grounded: факти, з яких написано пост ({"claim", "verbatim_quote"}), і ті, що не пройшли перевірку
     facts_used: list[dict] = []
     facts_rejected: list[dict] = []
+    # needs_manual_review: text — draft_for_review, пост НЕ пройшов перевірку фактів навіть після повторної спроби
+    needs_review: bool = False
+    # службове з відповіді моделі: status, regenerated, trusted_source, verification, draft_reasoning…
+    review: dict = {}
 
 
 class DraftResult(BaseModel):

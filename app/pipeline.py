@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import os
 import time
@@ -22,6 +23,15 @@ from .models import Article, Draft, DraftResult, RelevanceResult, RunSummary
 log = logging.getLogger("pipeline")
 
 STATUS = "New draft"  # новий драфт чекає на рецензента; далі статуси ставить людина
+# draft_grounded повернув needs_manual_review: пост не пройшов перевірку фактів — у таблицю з наявним статусом
+REVIEW_STATUS = "Needs fact-check"
+REVIEW_TITLE = "⚠ Не пройшов перевірку: "
+REVIEW_WARNING = ("⚠ НЕ ПЕРЕВІРЕНО. Модель не змогла підтвердити всі факти цього поста навіть після повторної спроби. "
+                  "Не публікувати без фактчеку — речення, що не пройшли перевірку, і причини — у блоці нижче.")
+
+
+def draft_status(d: Draft) -> str:
+    return REVIEW_STATUS if d.needs_review else STATUS
 # канал кнопки → lang для моделі Артема: за мовою вона обирає і формат (uk — пост для FB, en — тред для X)
 CHANNEL_LANG = {"fb": "uk", "x": "en"}
 PICK_SPARE = 5  # скільки зайвих кандидатів брати на випадок, коли їх розбирають паралельні прогони
@@ -84,14 +94,16 @@ def release_unwritten(run_id: str, picks: list[tuple[Article, RelevanceResult]],
 async def step_write_notion(run_id: str, database_id: str, r: DraftResult, channel: str | None = None) -> str:
     """Upsert у Notion: якщо для (article_id, run_id) рядок уже є — оновлюємо, інакше створюємо."""
     assert r.draft
+    review = r.draft.needs_review
     props = notion.build_properties(
-        draft=r.draft.headline,
+        draft=(REVIEW_TITLE if review else "") + r.draft.headline,
         source=f"{r.article.title} — {r.article.url}",
-        status=STATUS,
+        status=draft_status(r.draft),
     )
     body = (
         f"run_id: {run_id} · model: {r.draft.model_version} · канал: {channel or 'auto'} · мова: {r.draft.lang}\n\n"
-        f"{r.draft.text}"
+        + (f"{REVIEW_WARNING}\n\n" if review else "")
+        + r.draft.text
     )
     existing = db.find_draft_page(r.article.id, run_id)
     if existing:
@@ -99,6 +111,10 @@ async def step_write_notion(run_id: str, database_id: str, r: DraftResult, chann
         return existing
     # draft_grounded: під постом — факти з цитатами зі статті, щоб рецензент перевіряв Fact safety за хвилину
     facts = []
+    if review:
+        failed = _failure_lines(r.draft.review.get("verification"))
+        facts.append(notion.toggle(f"Що не пройшло перевірку ({len(failed)})",
+                                   failed or ["модель не вказала, які саме речення — див. draft_reasoning у postgen"]))
     if r.draft.facts_used:
         facts.append(notion.toggle(f"Факти, з яких написано пост ({len(r.draft.facts_used)}) — кожен підтверджено "
                                    "цитатою зі статті", [_fact_line(f) for f in r.draft.facts_used]))
@@ -112,6 +128,29 @@ async def step_write_notion(run_id: str, database_id: str, r: DraftResult, chann
 def _fact_line(f: dict) -> str:
     claim, quote = f.get("claim"), f.get("verbatim_quote")
     return f"{claim} — «{quote}»" if claim and quote else str(claim or quote or f)
+
+
+def _failure_lines(verification: object) -> list[str]:
+    """verification.deterministic_failures + judge_failures → «речення» → «фрагмент» — ВЕРДИКТ: причина.
+    Пункт судді (перевірено 29.09): {"text", "offending_span", "verdict", "reason", "sentence_id",
+    "matched_fact_indices"}; інші назви полів теж приймаємо, а незнайоме показуємо як JSON — рецензент побачить усе."""
+    if not isinstance(verification, dict):
+        return []
+    lines = []
+    for key in ("deterministic_failures", "judge_failures"):
+        for f in verification.get(key) or []:
+            if not isinstance(f, dict):
+                lines.append(str(f))
+                continue
+            text = next((f[k] for k in ("text", "sentence", "offending_text", "claim") if f.get(k)), "")
+            reason = next((f[k] for k in ("reason", "why", "explanation", "issue") if f.get(k)), "")
+            if not (text and reason):
+                lines.append(json.dumps(f, ensure_ascii=False))
+                continue
+            span, verdict = f.get("offending_span"), f.get("verdict")
+            head = f"«{text}»" + (f" → «{span}»" if span and span != text else "")
+            lines.append(f"{head} — " + (f"{verdict}: " if verdict else "") + reason)
+    return lines
 
 
 async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel: str | None = None,
@@ -147,7 +186,7 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel
                 status.report(run_id, channel, started, "у черзі", title=a.title,
                               note=f"(вже йдуть {MAX_PARALLEL_DRAFTS} генерації)")
             on_start = functools.partial(loop.call_soon_threadsafe, functools.partial(
-                status.report, run_id, channel, started, "генерується", title=a.title, note="(зазвичай 3–5 хв)"))
+                status.report, run_id, channel, started, "генерується", title=a.title, note="(зазвичай 3–10 хв)"))
             # модель на RunPod відповідає хвилинами — у власному пулі, щоб не блокувати вебхуки й запити до Notion
             _in_pool += 1
             try:
@@ -170,11 +209,15 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel
             step = "notion"
             res.notion_page_id = await step_write_notion(run_id, database_id, res, channel)
             in_notion.add(str(a.id))
-            status.report(run_id, channel, started, "готово", title=a.title, url=status.page_url(res.notion_page_id),
-                          note="→ у таблиці MVP")
+            if draft.needs_review:
+                status.report(run_id, channel, started, "не пройшов перевірку фактів", title=a.title,
+                              url=status.page_url(res.notion_page_id), note=f"→ у таблиці як {REVIEW_STATUS}")
+            else:
+                status.report(run_id, channel, started, "готово", title=a.title,
+                              url=status.page_url(res.notion_page_id), note="→ у таблиці MVP")
             step = "store"
             if pg.enabled():
-                pg.save_draft(run_id, res, STATUS)
+                pg.save_draft(run_id, res, draft_status(draft))
             written += 1
             db.upsert_draft(
                 run_id=run_id, article_id=a.id, notion_page_id=res.notion_page_id,

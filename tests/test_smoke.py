@@ -54,16 +54,44 @@ FACT = {"claim": "Vyriy unveiled Slavic.", "verbatim_quote": "Vyriy Industries h
 def test_runpod_draft_waits_for_cold_start():
     sent: list = []
     m = _runpod([{"id": "j1", "status": "IN_QUEUE"}, {"id": "j1", "status": "IN_PROGRESS"},
-                 {"id": "j1", "status": "COMPLETED", "output": {"post": " Пост 1/\n\nПост 2/ ", "facts_used": [FACT],
-                                                              "facts_rejected": [], "raw_extraction_output": "[…]"}}],
+                 {"id": "j1", "status": "COMPLETED", "output": {
+                     "status": "ok", "post": " Пост 1/\n\nПост 2/ ", "facts_used": [FACT], "facts_rejected": [],
+                     "trusted_source": "s", "verification": {"overall": "PASS"}, "raw_extraction_output": "[…]"}}],
                 sent)
     d = m.draft(ART)
-    assert (d.headline, d.text, d.lang) == (ART.title, "Пост 1/\n\nПост 2/", "uk")
+    assert (d.headline, d.text, d.lang, d.needs_review) == (ART.title, "Пост 1/\n\nПост 2/", "uk", False)
     assert d.model_version == "runpod-ep1:draft_grounded"  # режим у версії: оцінки до і після не змішуються
     assert (d.facts_used, d.facts_rejected) == ([FACT], [])
-    assert sent[0] == ("POST", "/v2/ep1/runsync",
-                       {"input": {"article_text": ART.text, "lang": "uk", "mode": "draft_grounded"}})
+    assert d.review == {"status": "ok", "trusted_source": "s", "verification": {"overall": "PASS"}}
+    # справжня назва видання — лише її модель має право цитувати
+    assert sent[0] == ("POST", "/v2/ep1/runsync", {"input": {
+        "article_text": ART.text, "lang": "uk", "mode": "draft_grounded", "source_name": "s"}})
     assert [s[1] for s in sent[1:]] == ["/v2/ep1/status/j1"] * 2
+
+
+REVIEW_OUT = {"status": "needs_manual_review", "post": None, "draft_for_review": " Чернетка з вигадкою. ",
+              "verification": {"overall": "FAIL", "deterministic_failures": [
+                  {"sentence": "Russia is trying to recruit him.", "reason": "not supported by any fact"}],
+                  # так пункт судді виглядав на живому ендпоінті 29.09
+                  "judge_failures": [{"matched_fact_indices": [5], "offending_span": "4%", "sentence_id": 1,
+                                      "text": "росія витрачає 4% ВВП на обслуговування боргу.", "verdict": "DISTORTED",
+                                      "reason": "Fact 5 says '4 trillion rubles this year'."},
+                                     "number 12.4% not in article"]},
+              "facts_used": [FACT], "facts_rejected": [], "trusted_source": None}
+
+
+def test_runpod_needs_manual_review_is_never_the_post():
+    sent: list = []
+    d = _runpod([{"id": "j7", "status": "COMPLETED", "output": REVIEW_OUT}], sent).draft(
+        ART.model_copy(update={"source": "unknown"}))
+    assert "source_name" not in sent[0][2]["input"]  # видання невідоме — не вигадуємо
+    assert (d.needs_review, d.text) == (True, "Чернетка з вигадкою.")  # post = null не чіпаємо
+    assert d.review["verification"]["overall"] == "FAIL"
+    with pytest.raises(ModelError, match="невідомий output.status"):
+        _runpod([{"id": "j8", "status": "COMPLETED", "output": {"status": "weird", "post": "x"}}], []).draft(ART)
+    with pytest.raises(ModelError, match="тексту немає"):
+        _runpod([{"id": "j9", "status": "COMPLETED", "output": {"status": "needs_manual_review", "post": None}}],
+                []).draft(ART)
 
 
 @pytest.mark.parametrize("job", [
@@ -342,6 +370,45 @@ async def test_run_gives_up_after_max_refusals(monkeypatch, tmp_path):
     assert (summary.status, summary.failure_type, fake.released) == ("failed", "GroundingRefused", [])
     run = db.get_run("r1")
     assert run and run["failure_step"] == "model"
+
+
+class ReviewModel(FakeModel):
+    """draft_grounded повернув needs_manual_review."""
+
+    def draft(self, article: Article, lang: str | None = None) -> Draft:
+        return super().draft(article, lang).model_copy(update={
+            "text": "Чернетка з вигадкою.", "needs_review": True, "facts_used": [FACT],
+            "review": {"status": "needs_manual_review", "verification": REVIEW_OUT["verification"]}})
+
+
+@pytest.mark.asyncio
+async def test_needs_manual_review_goes_to_table_as_needs_fact_check(monkeypatch, tmp_path):
+    sent = _board(monkeypatch, tmp_path, ["a1"])
+    saved: list = []
+    monkeypatch.setattr(pg, "save_draft", lambda run_id, r, st: saved.append(st))
+    created: list = []
+
+    async def fake_create(database_id, properties, body=None, extra_blocks=None):
+        created.append((properties, body, extra_blocks))
+        return {"id": "page-1"}
+
+    monkeypatch.setattr(notion, "create_row", fake_create)
+    summary = await pipeline.run_pipeline("r1", database_id="db", channel="x", model=ReviewModel())
+    assert (summary.status, summary.drafts_written) == ("ok", 1)
+    props, body, blocks = created[0]
+    assert props["Status"]["select"]["name"] == "Needs fact-check"  # наявна опція, таблицю не змінюємо
+    assert props["Draft"]["title"][0]["text"]["content"] == "⚠ Не пройшов перевірку: T"
+    assert "НЕ ПЕРЕВІРЕНО" in body and body.endswith("Чернетка з вигадкою.")
+    failed = [i["bulleted_list_item"]["rich_text"][0]["text"]["content"] for i in blocks[0]["toggle"]["children"]]
+    assert blocks[0]["toggle"]["rich_text"][0]["text"]["content"] == "Що не пройшло перевірку (3)"
+    assert failed == ["«Russia is trying to recruit him.» — not supported by any fact",
+                      "«росія витрачає 4% ВВП на обслуговування боргу.» → «4%» — DISTORTED: "
+                      "Fact 5 says '4 trillion rubles this year'.",
+                      "number 12.4% not in article"]
+    assert saved == ["Needs fact-check"]
+    await status.drain()
+    [line] = _board_lines(sent[-1][1])
+    assert "X — не пройшов перевірку фактів: «T» → у таблиці як Needs fact-check" in line
 
 
 class SlowModel(FakeModel):

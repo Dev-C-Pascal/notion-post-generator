@@ -44,16 +44,21 @@ def detect_lang(text: str) -> str:
 
 
 class RunPodModelClient:
-    """POST /runsync {"input": {"article_text", "lang", "mode"}} →
-    {"status": "COMPLETED", "output": {"post": "...", "facts_used": [...], "facts_rejected": [...]}}.
+    """POST /runsync {"input": {"article_text", "lang", "mode", "source_name"}} → {"status": "COMPLETED", "output": …}.
 
     lang — мова й формат поста, не мова статті: uk — довгий пост для FB, en — тред для X.
     Не задано — беремо мову статті. mode — draft_grounded (з 29.09): модель витягує факти, кожен перевіряє
-    дослівною цитатою зі статті і пише пост лише з підтверджених; draft — стара генерація по всій статті.
+    дослівною цитатою, пише пост і перевіряє його (детерміновано + суддя, одна повторна спроба);
+    draft — стара генерація по всій статті без жодної перевірки. source_name — справжня назва видання з бази
+    Андрія: лише її модель має право цитувати («— United24»); без неї пост не називає джерела взагалі.
+    output.status: ok — post перевірено; needs_manual_review — post = null, є draft_for_review (НЕ перевірено)
+    і verification з реченнями, що не пройшли; без status і з error — відмова ще до написання.
     На холодному старті runsync через ~90 с віддає IN_QUEUE / IN_PROGRESS без output — тоді опитуємо /status/{id}.
     """
 
-    def __init__(self, endpoint_id: str, api_key: str, *, mode: str = "draft_grounded", timeout_s: float = 600,
+    # 900 с: draft_grounded робить до 5 викликів моделі; 29.09 від запиту до відповіді минало до 572 с
+    # (черга + холодний старт до 404 с) — 600 с різали б такі задачі.
+    def __init__(self, endpoint_id: str, api_key: str, *, mode: str = "draft_grounded", timeout_s: float = 900,
                  poll_s: float = 5, transport: httpx.BaseTransport | None = None):
         self.mode = mode
         # режим — у версії: оцінки рецензентів до і після draft_grounded мають розділятись
@@ -64,9 +69,17 @@ class RunPodModelClient:
 
     def draft(self, article: Article, lang: str | None = None) -> Draft:
         lang = lang or detect_lang(article.text)
-        out = self._run({"article_text": article.text, "lang": lang, "mode": self.mode})
-        return Draft(article_id=article.id, headline=article.title, text=out["post"].strip(), model_version=self.version,
-                     lang=lang, facts_used=_facts(out.get("facts_used")), facts_rejected=_facts(out.get("facts_rejected")))
+        payload = {"article_text": article.text, "lang": lang, "mode": self.mode}
+        if article.source and article.source != "unknown":
+            payload["source_name"] = article.source
+        out = self._run(payload)
+        needs_review = out.get("status") == "needs_manual_review"
+        text = out["draft_for_review"] if needs_review else out["post"]
+        meta = {k: out[k] for k in ("status", "regenerated", "trusted_source", "verification",
+                                    "first_attempt_verification", "draft_reasoning") if out.get(k) is not None}
+        return Draft(article_id=article.id, headline=article.title, text=text.strip(), model_version=self.version,
+                     lang=lang, facts_used=_facts(out.get("facts_used")), facts_rejected=_facts(out.get("facts_rejected")),
+                     needs_review=needs_review, review=meta)
 
     def _run(self, payload: dict) -> dict:
         deadline = time.monotonic() + self.timeout_s
@@ -78,13 +91,22 @@ class RunPodModelClient:
                     raise ModelError(f"RunPod job {job['id']}: no result in {self.timeout_s:.0f}s")
                 time.sleep(self.poll_s)
                 job = c.get(f"/status/{job['id']}").raise_for_status().json()
+        jid = job.get("id")
         out = job.get("output") if isinstance(job.get("output"), dict) else {}
         error = out.get("error") or job.get("error")
         if error and REFUSAL_MARK in str(error):
-            raise GroundingRefused(f"RunPod job {job.get('id')}: {error}")
-        post = out.get("post") if job.get("status") == "COMPLETED" else None
-        if error or not isinstance(post, str) or not post.strip():  # output.error без поста не постимо
-            raise ModelError(f"RunPod job {job.get('id')}: status={job.get('status')} error={error!r}")
+            raise GroundingRefused(f"RunPod job {jid}: {error}")
+        if error or job.get("status") != "COMPLETED":
+            raise ModelError(f"RunPod job {jid}: status={job.get('status')} error={error!r}")
+        status = out.get("status")
+        if status == "needs_manual_review":  # post навмисно null; draft_for_review — лише для людини
+            text = out.get("draft_for_review")
+        elif status in ("ok", None):  # None — старий mode=draft, без перевірки
+            text = out.get("post")
+        else:
+            raise ModelError(f"RunPod job {jid}: невідомий output.status={status!r}")
+        if not isinstance(text, str) or not text.strip():
+            raise ModelError(f"RunPod job {jid}: status={status!r}, тексту немає")
         return out
 
 
