@@ -94,17 +94,28 @@ def test_runpod_needs_manual_review_is_never_the_post():
                 []).draft(ART)
 
 
-@pytest.mark.parametrize("job", [
-    # так відповів ендпоінт 29.09 на текст без фактів
-    {"id": "j4", "status": "FAILED", "error": "Extraction returned no parseable facts; refusing to draft.",
-     "output": {"raw_extraction_output": "[]"}},
-    # так описав Артем: факти є, але жоден не підтверджено цитатою
-    {"id": "j5", "status": "COMPLETED",
-     "output": {"error": "No extracted facts are grounded in the article; refusing to draft."}},
+@pytest.mark.parametrize("job, text", [
+    # v15 (29.09, перевірено живим викликом): нормальна відмова — COMPLETED + output.error_message
+    ({"id": "j10", "status": "COMPLETED", "output": {
+        "error_message": "Extraction returned no parseable facts; refusing to draft.", "raw_extraction_output": "[]"}},
+     "no parseable facts"),
+    # погані вхідні дані — теж відмова від статті, не збій
+    ({"id": "j11", "status": "COMPLETED", "output": {"error_message": "Input article_text is empty."}}, "is empty"),
+    # до v15: FAILED + job.error (RunPod резервує "error") — лишаємо розпізнавання
+    ({"id": "j4", "status": "FAILED", "error": "Extraction returned no parseable facts; refusing to draft.",
+      "output": {"raw_extraction_output": "[]"}}, "refusing to draft"),
+    ({"id": "j5", "status": "COMPLETED",
+      "output": {"error": "No extracted facts are grounded in the article; refusing to draft."}}, "refusing to draft"),
 ])
-def test_runpod_grounding_refusal(job):
-    with pytest.raises(GroundingRefused, match="refusing to draft"):
+def test_runpod_grounding_refusal(job, text):
+    with pytest.raises(GroundingRefused, match=text):
         _runpod([job], []).draft(ART)
+
+
+def test_failure_lines_flag_invalid_judge():
+    lines = pipeline._failure_lines({"overall": "FAIL", "judge_output_invalid": True, "judge_failures": [],
+                                     "judge_raw": "not json"})
+    assert lines == ["Суддя повернув невалідну відповідь — його вердикту не довіряємо: перевірте весь текст"]
 
 
 def test_runpod_lang_from_channel_overrides_article():

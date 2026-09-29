@@ -137,6 +137,8 @@ def _failure_lines(verification: object) -> list[str]:
     if not isinstance(verification, dict):
         return []
     lines = []
+    if verification.get("judge_output_invalid"):  # суддя відповів непарсабельно або процитував те, чого нема в пості
+        lines.append("Суддя повернув невалідну відповідь — його вердикту не довіряємо: перевірте весь текст")
     for key in ("deterministic_failures", "judge_failures"):
         for f in verification.get(key) or []:
             if not isinstance(f, dict):

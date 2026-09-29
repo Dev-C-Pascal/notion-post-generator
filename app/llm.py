@@ -31,8 +31,9 @@ class GroundingRefused(ModelError):
     дослівною цитатою. Це властивість статті, а не збій: брати її вдруге марно."""
 
 
-# відмову модель повертає по-різному: status FAILED + error «Extraction returned no parseable facts; refusing to
-# draft.» (перевірено 29.09) або output.error «No extracted facts are grounded…; refusing to draft.» (за описом Артема)
+# Відмова (немає фактів / жоден не підтверджено / погані вхідні дані) з версії ендпоінта 15 (29.09) — завжди
+# job COMPLETED + output.error_message. До v15 вона приходила як job FAILED + error «…refusing to draft.» (RunPod
+# резервує ключ "error" у відповіді хендлера) — цей варіант теж розпізнаємо. "error" тепер лише справжній збій.
 REFUSAL_MARK = "refusing to draft"
 
 
@@ -52,7 +53,7 @@ class RunPodModelClient:
     draft — стара генерація по всій статті без жодної перевірки. source_name — справжня назва видання з бази
     Андрія: лише її модель має право цитувати («— United24»); без неї пост не називає джерела взагалі.
     output.status: ok — post перевірено; needs_manual_review — post = null, є draft_for_review (НЕ перевірено)
-    і verification з реченнями, що не пройшли; без status і з error — відмова ще до написання.
+    і verification з реченнями, що не пройшли; output.error_message без status — відмова ще до написання.
     На холодному старті runsync через ~90 с віддає IN_QUEUE / IN_PROGRESS без output — тоді опитуємо /status/{id}.
     """
 
@@ -93,9 +94,10 @@ class RunPodModelClient:
                 job = c.get(f"/status/{job['id']}").raise_for_status().json()
         jid = job.get("id")
         out = job.get("output") if isinstance(job.get("output"), dict) else {}
+        refusal = out.get("error_message")
         error = out.get("error") or job.get("error")
-        if error and REFUSAL_MARK in str(error):
-            raise GroundingRefused(f"RunPod job {jid}: {error}")
+        if refusal or (error and REFUSAL_MARK in str(error)):
+            raise GroundingRefused(f"RunPod job {jid}: {refusal or error}")
         if error or job.get("status") != "COMPLETED":
             raise ModelError(f"RunPod job {jid}: status={job.get('status')} error={error!r}")
         status = out.get("status")
