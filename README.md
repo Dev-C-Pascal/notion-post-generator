@@ -63,6 +63,7 @@ tests/           unit, e2e з mock-Notion, API
 | `POSTGEN_DB_PASSWORD` | наша база драфтів (сервіс `db` у compose) |
 | `RUNPOD_ENDPOINT_ID`, `RUNPOD_API_KEY` | модель; без них `/health` = 500 і деплой відкочується |
 | `RUNPOD_MODE` | `draft_grounded` (за замовчуванням) — пост лише з фактів, підтверджених цитатою; `draft` — старий режим |
+| `MAX_PARALLEL_DRAFTS` | скільки генерацій одночасно (за замовчуванням 3, на сервері 10); решта чекає в черзі з місцем у рядку статусу |
 
 ## Локально
 

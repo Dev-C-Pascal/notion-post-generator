@@ -536,7 +536,42 @@ async def test_status_board_coalesces_bursts(monkeypatch, tmp_path):
     await status.drain()
     assert len(sent) == 1  # 20 подій поспіль — одне оновлення блоку, а не 20 (ліміт Notion ~3 запити/с)
     lines = _board_lines(sent[-1][1])
-    assert len(lines) == status.MAX_LINES and "подія 19" in lines[0] and "подія 15" in lines[-1]
+    assert len(lines) == status.MAX_LINES and "подія 19" in lines[0] and f"подія {20 - status.MAX_LINES}" in lines[-1]
+
+
+@pytest.mark.asyncio
+async def test_status_board_shows_queue_position(monkeypatch, tmp_path):
+    # натискань більше, ніж місць у пулі: ті, що чекають, бачать своє місце, і воно посувається
+    n = pipeline.MAX_PARALLEL_DRAFTS + 2
+    sent = _board(monkeypatch, tmp_path, [f"a{i}" for i in range(n)])
+    monkeypatch.setattr(pipeline, "_waiting", [])
+    monkeypatch.setattr(pipeline, "_waiting_info", {})
+
+    async def fake_create(database_id, properties, body=None, extra_blocks=None):
+        return {"id": "page-1"}
+
+    monkeypatch.setattr(notion, "create_row", fake_create)
+    states: dict[str, list[str]] = {}  # послідовність станів кожного натискання (рендер блоку зливає проміжні)
+    report = status.report
+
+    def spy(run_id, channel, started, state, **kw):
+        states.setdefault(run_id, []).append(state)
+        report(run_id, channel, started, state, **kw)
+
+    monkeypatch.setattr(status, "report", spy)
+    model = SlowModel()
+    await asyncio.gather(*(pipeline.run_pipeline(f"r{i}", database_id="db", channel="fb", model=model)
+                           for i in range(n)))
+    await status.drain()
+    def changes(run_id: str) -> list[str]:  # місце в черзі перепоказується при кожному старті — повтори прибираємо
+        seq = [s for s in states[run_id] if s != "шукаю статтю…"]
+        return [s for i, s in enumerate(seq) if i == 0 or s != seq[i - 1]]
+
+    # останнє натискання: 2-ге в черзі → черга посунулась → генерується → готово
+    assert changes(f"r{n - 1}") == ["у черзі: 2-й", "у черзі: 1-й", "генерується", "готово"]
+    assert changes("r0") == ["генерується", "готово"]  # перші — без черги
+    assert sum("готово" in line for line in _board_lines(sent[-1][1])) == n  # фінал у блоці — усі готові
+    assert pipeline._waiting == []
 
 
 def test_api():

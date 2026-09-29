@@ -42,6 +42,25 @@ PICK_SPARE = 5  # скільки зайвих кандидатів брати н
 MAX_PARALLEL_DRAFTS = int(os.environ.get("MAX_PARALLEL_DRAFTS", "3"))
 _MODEL_POOL = ThreadPoolExecutor(max_workers=MAX_PARALLEL_DRAFTS, thread_name_prefix="model")
 _in_pool = 0  # скільки прогонів зараз у пулі моделі (генерують або чекають) — для «у черзі» в рядку статусу
+_waiting: list[str] = []  # прогони, що чекають місця в пулі, у порядку черги (пул бере їх FIFO)
+_waiting_info: dict[str, tuple[str | None, str, str]] = {}  # run_id → (канал, час натискання, назва статті)
+
+
+def _report_queue() -> None:
+    """Оновити в рядку статусу місце кожного, хто чекає: люди бачать, що їхнє натискання не загубилось."""
+    for pos, rid in enumerate(_waiting, 1):
+        channel, started, title = _waiting_info[rid]
+        status.report(rid, channel, started, f"у черзі: {pos}-й", title=title,
+                      note=f"(одночасно генеруються {MAX_PARALLEL_DRAFTS})")
+
+
+def _generation_started(run_id: str, channel: str | None, started: str, title: str) -> None:
+    """У потоці event loop: генерація справді почалась — прибрати прогін з черги й посунути решту."""
+    if run_id in _waiting:
+        _waiting.remove(run_id)
+        _waiting_info.pop(run_id, None)
+    status.report(run_id, channel, started, "генерується", title=title, note="(зазвичай 3–10 хв)")
+    _report_queue()
 # mode=draft_grounded може відмовитись від статті (немає фактів, підтверджених цитатою) — тоді в тому ж прогоні
 # беремо наступну, але не більше MAX_REFUSALS разів: кожна спроба — це виклик моделі
 MAX_REFUSALS = 2
@@ -185,10 +204,11 @@ async def run_pipeline(run_id: str, *, database_id: str, limit: int = 1, channel
             res = DraftResult(article=a, relevance=rel)
             step = "model"
             if _in_pool >= MAX_PARALLEL_DRAFTS:
-                status.report(run_id, channel, started, "у черзі", title=a.title,
-                              note=f"(вже йдуть {MAX_PARALLEL_DRAFTS} генерації)")
+                _waiting.append(run_id)
+                _waiting_info[run_id] = (channel, started, a.title)
+                _report_queue()
             on_start = functools.partial(loop.call_soon_threadsafe, functools.partial(
-                status.report, run_id, channel, started, "генерується", title=a.title, note="(зазвичай 3–10 хв)"))
+                _generation_started, run_id, channel, started, a.title))
             # модель на RunPod відповідає хвилинами — у власному пулі, щоб не блокувати вебхуки й запити до Notion
             _in_pool += 1
             try:
