@@ -52,6 +52,8 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
+      # статичні звіти для /reports/*; кладемо через scp, без коміту
+      - /srv/www:/srv/www:ro
     depends_on:
       - app
 

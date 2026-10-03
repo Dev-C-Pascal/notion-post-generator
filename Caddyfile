@@ -2,10 +2,15 @@
 # Назовні — лише те, що потрібно кнопкам Notion, ручному запуску й моніторингу: /webhook*, /run, /health.
 # Решта (/runs і /runs/{id} з текстами неопублікованих драфтів, /notion/check, /articles, /docs, /openapi.json)
 # — лише з самого сервера: curl 127.0.0.1:8000/runs
+# /reports/* — статичні сторінки (не частина бекенду): файли з /srv/www на хості, напр. /reports/ukraine-population/
 {$DOMAIN} {
     @public path /health /run /webhook /webhook/*
     handle @public {
         reverse_proxy app:8000
+    }
+    handle_path /reports/* {
+        root * /srv/www
+        file_server
     }
     handle {
         respond 404
