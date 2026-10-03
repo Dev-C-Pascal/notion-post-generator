@@ -550,7 +550,7 @@ async def test_status_board_reports_failure_and_restart(monkeypatch, tmp_path):
     status.restarted()  # після перезапуску бекенду «генерується» не висить
     await status.drain()
     [line] = _board_lines(sent[-1][1])
-    assert "бекенд перезапущено" in line
+    assert "бекенд запущено." in line and "обірвано" not in line
 
 
 @pytest.mark.asyncio
