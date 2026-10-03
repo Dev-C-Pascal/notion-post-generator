@@ -465,19 +465,44 @@ async def test_parallel_clicks_do_not_starve_notion(monkeypatch, tmp_path):
     assert model.peak == pipeline.MAX_PARALLEL_DRAFTS
 
 
-def _board(monkeypatch, tmp_path, feed: list[str]) -> list:
-    """Рядок статусу ввімкнено, Notion-блок підмінено: повертає список надісланих оновлень блоку."""
+def _board(monkeypatch, tmp_path, feed: list[str], tree: dict | None = None) -> list:
+    """Рядок статусу ввімкнено, Notion-блоки підмінено: повертає список надісланих оновлень блоків.
+    tree — id блоку → дочірні блоки, як їх бачить Notion (callout «blk» спершу порожній)."""
     monkeypatch.setenv("NOTION_STATUS_BLOCK_ID", "blk")
     monkeypatch.setattr(status, "_lines", {})
     monkeypatch.setattr(status, "_pending", False)
     monkeypatch.setattr(status, "_lock", None)  # замок прив'язується до event loop, а в кожного тесту свій
+    monkeypatch.setattr(status, "_body_id", None)
     sent: list = []
+    tree = {"blk": []} if tree is None else tree
+    tree.setdefault("blk", [])
+    ids = iter(range(1, 10_000))  # нові id не повторюють видалені (як у Notion)
 
     async def fake_update_block(block_id, payload):
+        if block_id not in tree:
+            raise RuntimeError("Notion 404: object_not_found")  # блок видалили руками
         sent.append((block_id, payload))
         return {}
 
+    async def fake_list_children(block_id):
+        return list(tree.get(block_id, []))
+
+    async def fake_append_children(block_id, children):
+        made = []
+        for c in children:
+            b = {"id": f"b{next(ids)}", "type": c["type"]}
+            tree[b["id"]] = []
+            tree[block_id].append(b)
+            for g in c[c["type"]].get("children", []):
+                gid = f"b{next(ids)}"
+                tree[gid] = []
+                tree[b["id"]].append({"id": gid, "type": g["type"]})
+            made.append(b)
+        return made
+
     monkeypatch.setattr(notion, "update_block", fake_update_block)
+    monkeypatch.setattr(notion, "list_children", fake_list_children)
+    monkeypatch.setattr(notion, "append_children", fake_append_children)
     monkeypatch.setattr(db, "RUNS_DB", tmp_path / "runs.db")
     db.init_db()
     FakeUsed().install(monkeypatch, feed)
@@ -486,8 +511,8 @@ def _board(monkeypatch, tmp_path, feed: list[str]) -> list:
 
 
 def _board_lines(payload: dict) -> list[str]:
-    text = "".join(s["text"]["content"] for s in payload["callout"]["rich_text"])
-    return text.split("\n")[1:]  # перший рядок — заголовок
+    """Рядки натискань з оновлення paragraph у toggle (підказка живе окремо, у самому callout)."""
+    return "".join(s["text"]["content"] for s in payload["paragraph"]["rich_text"]).split("\n")
 
 
 @pytest.mark.asyncio
@@ -503,10 +528,10 @@ async def test_status_board_follows_each_click(monkeypatch, tmp_path):
     await status.drain()
     block_id, payload = sent[-1]
     lines = _board_lines(payload)
-    assert block_id == "blk" and len(lines) == 2
+    assert block_id != "blk" and len(lines) == 2  # рядки — не в callout, а в paragraph у toggle
     assert "X — немає свіжих статей" in lines[0]  # новіші зверху
     assert "FB — готово: «T» → у таблиці MVP" in lines[1]
-    [link] = [s["text"]["link"]["url"] for s in payload["callout"]["rich_text"] if s["text"].get("link")]
+    [link] = [s["text"]["link"]["url"] for s in payload["paragraph"]["rich_text"] if s["text"].get("link")]
     assert link == "https://www.notion.so/page1"  # назва — посилання на рядок драфту
 
 
@@ -534,9 +559,36 @@ async def test_status_board_coalesces_bursts(monkeypatch, tmp_path):
     for i in range(20):
         status.report(f"r{i}", "fb", "12:00", f"подія {i}")
     await status.drain()
-    assert len(sent) == 1  # 20 подій поспіль — одне оновлення блоку, а не 20 (ліміт Notion ~3 запити/с)
+    # 20 подій поспіль — одне оновлення рядків, а не 20 (ліміт Notion ~3 запити/с)
+    assert len([p for _, p in sent if "paragraph" in p]) == 1
     lines = _board_lines(sent[-1][1])
     assert len(lines) == status.MAX_LINES and "подія 19" in lines[0] and f"подія {20 - status.MAX_LINES}" in lines[-1]
+
+
+@pytest.mark.asyncio
+async def test_status_board_lives_in_collapsed_toggle(monkeypatch, tmp_path):
+    tree: dict = {}
+    sent = _board(monkeypatch, tmp_path, [], tree)
+    status.report("r1", "fb", "12:00", "подія 1")
+    await status.drain()
+    status.report("r2", "x", "12:01", "подія 2")
+    await status.drain()
+    # у callout — лише коротка підказка, один раз; рядки — у paragraph всередині одного toggle
+    assert [p for b, p in sent if b == "blk"] == [{"callout": {"rich_text": [status._seg(status.HEADER)]}}]
+    [toggle] = tree["blk"]
+    [body] = tree[toggle["id"]]
+    assert (toggle["type"], body["type"]) == ("toggle", "paragraph")
+    assert [b for b, p in sent if b != "blk"] == [body["id"]] * 2
+    assert "подія 2" in _board_lines(sent[-1][1])[0]
+
+    # toggle видалили руками — наступне оновлення створює його заново, а не мовчки падає
+    tree.pop(tree.pop(toggle["id"])[0]["id"])
+    tree["blk"].clear()
+    status.report("r3", "fb", "12:02", "подія 3")
+    await status.drain()
+    [toggle2] = tree["blk"]
+    assert toggle2["id"] != toggle["id"] and sent[-1][0] == tree[toggle2["id"]][0]["id"]
+    assert "подія 3" in _board_lines(sent[-1][1])[0]
 
 
 @pytest.mark.asyncio

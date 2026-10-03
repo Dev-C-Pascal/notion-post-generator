@@ -134,6 +134,20 @@ async def update_block(block_id: str, payload: dict) -> dict:
         return await _send(client, "PATCH", f"{NOTION_API}/blocks/{block_id}", json=payload)
 
 
+async def list_children(block_id: str) -> list[dict]:
+    """GET /v1/blocks/{id}/children — перші 100 дочірніх блоків (для службових блоків більше не буває)."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await _send(client, "GET", f"{NOTION_API}/blocks/{block_id}/children", params={"page_size": BLOCKS_LIMIT})
+    return r.get("results", [])
+
+
+async def append_children(block_id: str, children: list[dict]) -> list[dict]:
+    """PATCH /v1/blocks/{id}/children — додати блоки (до двох рівнів вкладення); повертає створені блоки."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await _send(client, "PATCH", f"{NOTION_API}/blocks/{block_id}/children", json={"children": children})
+    return r.get("results", [])
+
+
 async def update_row(page_id: str, properties: dict) -> dict:
     """PATCH /v1/pages/{id} — оновити властивості існуючого рядка."""
     async with httpx.AsyncClient(timeout=30) as client:
