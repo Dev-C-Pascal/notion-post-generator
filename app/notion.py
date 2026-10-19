@@ -162,11 +162,15 @@ async def get_database(database_id: str) -> dict:
 
 async def query_edited_since(database_id: str, since: str) -> list[dict]:
     """POST /v1/databases/{id}/query — рядки, змінені з `since` (ISO), від старих до нових; усі сторінки курсора."""
-    body: dict = {
-        "filter": {"timestamp": "last_edited_time", "last_edited_time": {"on_or_after": since}},
-        "sorts": [{"timestamp": "last_edited_time", "direction": "ascending"}],
-        "page_size": 100,
-    }
+    return await query_rows(database_id, {"timestamp": "last_edited_time", "last_edited_time": {"on_or_after": since}},
+                            sorts=[{"timestamp": "last_edited_time", "direction": "ascending"}])
+
+
+async def query_rows(database_id: str, filter: dict, sorts: list[dict] | None = None) -> list[dict]:
+    """POST /v1/databases/{id}/query — усі рядки під фільтр (усі сторінки курсора)."""
+    body: dict = {"filter": filter, "page_size": 100}
+    if sorts:
+        body["sorts"] = sorts
     pages: list[dict] = []
     async with httpx.AsyncClient(timeout=30) as client:
         while True:

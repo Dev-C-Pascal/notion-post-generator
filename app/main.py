@@ -5,6 +5,7 @@
       select (топ дня Андрія) → draft (модель на RunPod) → write_notion (рядок у MVP) + postgen
       → runs.db: журнал прогону та драфтів
 """
+import asyncio
 import hmac
 import logging
 import os
@@ -14,7 +15,7 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import db, notion, pg, pipeline, status
+from . import db, healthcheck, notion, pg, pipeline, status
 from .llm import get_model_client
 
 load_dotenv()
@@ -41,7 +42,10 @@ async def _startup() -> None:
     db.init_db()
     if pg.enabled():
         pg.init_db()
+        healthcheck.init_db()
         log.info("drafts Postgres ready")
+        if healthcheck.EVERY_DAYS:
+            app.state.healthcheck_schedule = asyncio.create_task(healthcheck.schedule_loop())
     log.info("DBs ready: %s, %s; target Notion DB=%s", db.ARTICLES_DB, db.RUNS_DB, DATABASE_ID)
     status.restarted()  # у блоці статусу міг лишитись «генерується» від обірваних прогонів
 
@@ -112,3 +116,39 @@ async def webhook(request: Request, background: BackgroundTasks, channel: str | 
     page = (payload.get("data") if isinstance(payload, dict) else None) or {}
     log.info("webhook from page=%s channel=%s", page.get("id"), channel)
     return _start_run(background, channel)
+
+
+# Health Check — лише з сервера (Caddy назовні не пускає): curl 127.0.0.1:8000/health-check …
+@app.post("/health-check", status_code=202)
+async def health_check_start(request: Request, background: BackgroundTasks) -> JSONResponse:
+    """Прогін еталонного набору. Тіло (необов'язково): {"endpoint_id": "...", "mode": "..."} — інша версія моделі;
+    {"resume": "<run_id>"} — догенерувати обірваний прогін тією ж моделлю."""
+    _check_secret(request)
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    try:
+        model = None if body.get("resume") else healthcheck.model_for(body.get("endpoint_id"), body.get("mode"))
+        run_id, model = healthcheck.start("manual", model, resume=body.get("resume"))
+    except healthcheck.AlreadyRunning as e:
+        raise HTTPException(status_code=409, detail=f"health check {e} ще йде") from e
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail="run not found or still running") from e
+    log.info("health check %s: %s", run_id, model.version)
+    background.add_task(healthcheck.run, run_id, model)
+    return JSONResponse(status_code=202, content={"run_id": run_id, "model_version": model.version})
+
+
+@app.get("/health-check/runs")
+def health_check_runs() -> list:
+    return healthcheck.list_runs()
+
+
+@app.get("/health-check/runs/{run_id}")
+def health_check_run(run_id: str) -> dict:
+    r = healthcheck.get_run(run_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="run not found")
+    return r

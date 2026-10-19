@@ -56,6 +56,16 @@ TOPIC_PICKS = """
 """
 
 
+BY_IDS = """
+    SELECT a.article_id::text, a.url_canonical, coalesce(a.title, ''), a.body_text,
+           coalesce(s.name, s.domain, 'unknown'), coalesce(a.published_at::text, '')
+    FROM core.article a
+    LEFT JOIN core.source s ON s.source_id = a.source_id
+    WHERE a.article_id::text = ANY(%s::text[])
+      AND a.retrieval_status = 'full_text' AND coalesce(a.body_text, '') <> ''
+"""
+
+
 def enabled() -> bool:
     return bool(os.environ.get("COMMS_DATABASE_URL"))
 
@@ -79,6 +89,12 @@ def fetch_picks(limit: int, exclude: set[str]) -> list[tuple[Article, RelevanceR
             reason = f"тематичний відбір (у топі дня вільних статей немає): тема «{topic}», бал {score:.3f}"
             picks.append(_pick(aid, url, title, text, source, published, topic, score, reason))
     return picks
+
+
+def fetch_by_ids(ids: list[str]) -> dict[str, Article]:
+    """Статті з повним текстом за id (для еталонного набору Health Check); без тексту — їх у відповіді немає."""
+    return {aid: Article(id=aid, url=url, title=title, text=text, source=source, published_at=published)
+            for aid, url, title, text, source, published in _query(BY_IDS, (ids,))}
 
 
 def _pick(aid: str, url: str, title: str, text: str, source: str, published: str, topic: str, score: float,
