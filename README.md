@@ -45,6 +45,13 @@ app/notion.py    Notion REST API 2022-06-28: створення рядка, ті
 app/pg.py        Postgres postgen: drafts, draft_versions, used_articles, sync_state
 app/status.py    рядок статусу під кнопками в Notion: шукаю статтю → у черзі → генерується → готово / не вдалося
 app/db.py        SQLite runs.db: журнал прогонів
+Health Check (CONTEXT.md §16–17): чи не стали пости гіршими після зміни моделі та раз на тиждень
+app/healthcheck.py  еталонний набір (100 статей), окремий прогін моделі, розклад
+app/hc_eval.py      агент-оцінювач: інструкція Антона (app/prompts/) + дешева модель Anthropic → hc_evals
+app/hc_compare.py   метрики прогону й попарне порівняння двох прогонів (знаковий тест)
+app/hc_report.py    звіт (markdown), збереження, публікація підсторінкою в Notion
+app/hc_alert.py     коли тривожити (поріг + значущість) і доставка: журнал, вебхук, Telegram
+app/hc_flow.py      ланцюжок після прогону: оцінка → порівняння → звіт → алерт
 app/models.py    pydantic-моделі кроків
 tests/           unit, e2e з mock-Notion, API
 ```
@@ -64,6 +71,8 @@ tests/           unit, e2e з mock-Notion, API
 | `RUNPOD_ENDPOINT_ID`, `RUNPOD_API_KEY` | модель; без них `/health` = 500 і деплой відкочується |
 | `RUNPOD_MODE` | `draft_grounded` (за замовчуванням) — пост лише з фактів, підтверджених цитатою; `draft` — старий режим |
 | `MAX_PARALLEL_DRAFTS` | скільки генерацій одночасно (за замовчуванням 3, на сервері 10); решта чекає в черзі з місцем у рядку статусу |
+| `ANTHROPIC_API_KEY` | агент-оцінювач Health Check (claude-haiku-5-5); без нього оцінки, звіту й алерту немає |
+| `HEALTHCHECK_*`, `NOTION_HEALTHCHECK_PAGE_ID` | розклад, пороги, канали алерту, сторінка для звітів — перелік у [`.env.example`](.env.example) |
 
 ## Локально
 
@@ -75,7 +84,8 @@ ruff check app tests && mypy app && pytest -q
 
 ## Деплой
 
-- `ci.yml` — на кожен push (крім комітів лише з `*.md`): ruff, mypy, pytest, `docker build` з тегом git sha.
+- `ci.yml` — на кожен push (крім комітів лише з `*.md`): ruff, mypy, pytest (з Postgres 16 як service-контейнером для тестів
+  Health Check), `docker build` з тегом git sha.
 - `deploy.yml` — **лише після зеленого CI** на push у `main` (або вручну): SSH на EC2 → checkout того sha,
   що пройшов CI → `IMAGE_TAG=<sha>` у `.env` → `docker compose up -d --build` → smoke `/health` → при збої відкат
   на попередній sha. Старіший коміт поверх новішого не деплоїться; один деплой за раз. Деплой перезапускає
