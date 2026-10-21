@@ -387,7 +387,7 @@ async def test_fatal_judge_error_stops_the_whole_evaluation(seed_run):
 # ---------- ланцюжок і ендпоінти ----------
 
 async def test_after_run_never_raises_and_does_not_overlap(monkeypatch):
-    calls = []
+    calls, reports = [], []
 
     async def fake_eval(run_id, judge=None, *, force=False):
         calls.append((run_id, force))
@@ -395,10 +395,15 @@ async def test_after_run_never_raises_and_does_not_overlap(monkeypatch):
         if run_id == "boom":
             raise RuntimeError("немає ключа")
 
+    async def fake_report(run_id, base_id=None, judge_key=None, **kw):
+        reports.append((run_id, judge_key))
+
     monkeypatch.setattr(hc_eval, "evaluate_run", fake_eval)
+    monkeypatch.setattr(hc_flow, "make_report", fake_report)
     await hc_flow.after_run("hc-1", force=True)
     await hc_flow.after_run("boom")  # збій оцінки не кидається нагору
     assert calls == [("hc-1", True), ("boom", False)] and not hc_flow.is_busy("hc-1") and not hc_flow.is_busy("boom")
+    assert reports == [("hc-1", None)]  # звіт будується лише після успішної оцінки
 
 
 async def test_run_hands_a_finished_run_to_the_evaluator_only_when_enabled(monkeypatch):

@@ -121,6 +121,19 @@ async def create_row(database_id: str, properties: dict, body: str | None = None
     return page
 
 
+async def create_page(parent_page_id: str, title: str, blocks: list[dict]) -> dict:
+    """POST /v1/pages — нова підсторінка під існуючою сторінкою (напр. звіт Health Check). Лише створює: нічого, що вже є
+    в Notion, не змінює і не видаляє. Блоки понад 100 дописуються окремими запитами."""
+    payload = {"parent": {"page_id": parent_page_id}, "properties": {"title": {"title": _rich(title)}},
+               "children": blocks[:BLOCKS_LIMIT]}
+    async with httpx.AsyncClient(timeout=30) as client:
+        page = await _send(client, "POST", f"{NOTION_API}/pages", json=payload)
+        for i in range(BLOCKS_LIMIT, len(blocks), BLOCKS_LIMIT):
+            await _send(client, "PATCH", f"{NOTION_API}/blocks/{page['id']}/children",
+                        json={"children": blocks[i:i + BLOCKS_LIMIT]})
+    return page
+
+
 async def append_body(page_id: str, body: str) -> dict:
     """PATCH /v1/blocks/{id}/children — дописати текст у контент існуючого рядка."""
     async with httpx.AsyncClient(timeout=30) as client:

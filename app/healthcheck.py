@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from . import comms, hc_eval, notion, pg, pipeline
+from . import comms, hc_eval, hc_report, notion, pg, pipeline
 from .llm import GroundingRefused, ModelClient, RunPodModelClient
 from .models import Article, Draft
 
@@ -148,7 +148,8 @@ async def build_reference_set(per_channel: int = PER_CHANNEL) -> dict[str, int]:
 def init_db() -> None:
     with pg._connect() as c:
         c.execute(SCHEMA)
-    hc_eval.init_db()  # оцінки посилаються на hc_runs і hc_articles, тож після них
+    hc_eval.init_db()  # оцінки й звіти посилаються на hc_runs і hc_articles, тож після них
+    hc_report.init_db()
     with pg._connect() as c:
         # прогін, що йшов під час деплою/перезапуску, уже ніхто не допише сам — лише {"resume": run_id}
         c.execute("UPDATE hc_runs SET status = 'interrupted', finished_at = now() WHERE status = 'running'")

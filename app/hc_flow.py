@@ -12,7 +12,7 @@ import json
 import logging
 import sys
 
-from . import hc_compare, hc_eval
+from . import hc_compare, hc_eval, hc_report
 
 log = logging.getLogger("hc_flow")
 
@@ -24,13 +24,28 @@ def is_busy(run_id: str) -> bool:
 
 
 async def after_run(run_id: str, *, judge: hc_eval.Judge | None = None, force: bool = False) -> None:
+    """Оцінка драфтів → звіт (порівняння з попереднім і еталонним прогоном; зберегти й опублікувати)."""
     if run_id in _busy:
         return
     _busy.add(run_id)
     try:
         await hc_eval.evaluate_run(run_id, judge, force=force)
+        await make_report(run_id, judge_key=judge.key if judge else None, evaluate_missing=judge is None, save=True)
     except Exception:
         log.exception("health check %s: кроки після прогону не завершились", run_id)
+    finally:
+        _busy.discard(run_id)
+
+
+async def rebuild_report(run_id: str) -> None:
+    """Зібрати звіт наново (дооцінивши те, чого бракує), зберегти й опублікувати; не кидає винятків."""
+    if run_id in _busy:
+        return
+    _busy.add(run_id)
+    try:
+        await make_report(run_id, evaluate_missing=hc_eval.enabled(), save=True)
+    except Exception:
+        log.exception("health check %s: звіт не зібрано", run_id)
     finally:
         _busy.discard(run_id)
 
@@ -62,14 +77,48 @@ async def compare_runs(run_id: str, base_id: str | None = None, judge_key: str |
     return c
 
 
+async def make_report(run_id: str, base_id: str | None = None, judge_key: str | None = None, *,
+                      evaluate_missing: bool = False, save: bool = False) -> str | None:
+    """Звіт по прогону (markdown): з попереднім завершеним прогоном і, якщо він інший, з еталонним. None — прогону нема.
+    save: зберегти в hc_reports і опублікувати в Notion (якщо задано NOTION_HEALTHCHECK_PAGE_ID); збій Notion звіт не губить."""
+    run = hc_compare.run_info(run_id)
+    if not run:
+        return None
+    key = judge_key or hc_eval.current_judge_key()
+    prev = await compare_runs(run_id, base_id, judge_key, evaluate_missing=evaluate_missing)
+    baseline_id = hc_compare.baseline_run(run_id)
+    baseline = None
+    if baseline_id and (prev is None or baseline_id != prev.base_run):
+        baseline = await compare_runs(run_id, baseline_id, judge_key, evaluate_missing=evaluate_missing)
+    ref = prev or baseline
+    summary = ref.new if ref else hc_compare.summarize_scopes(hc_compare.load_rows(run_id, key))
+    level: str | None = None if ref else "info"  # без бази це перший прогін: він сам стає базою
+    reasons: list[str] = []
+    markdown = hc_report.render(run, summary, key, prev=prev, baseline=baseline, level=level, reasons=reasons)
+    if save:
+        url = None
+        try:
+            url = await hc_report.publish(run_id, markdown, level)
+        except Exception:
+            log.exception("health check %s: звіт не опубліковано в Notion", run_id)
+        hc_report.save_report(run_id, key, markdown=markdown, summary=summary, base_run=prev.base_run if prev else None,
+                              baseline_run=baseline.base_run if baseline else None, level=level, reasons=reasons,
+                              notion_url=url)
+    return markdown
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    usage = "usage: python -m app.hc_flow evaluate <run_id> [--force] | compare <run_id> [<base_run_id>]"
+    usage = ("usage: python -m app.hc_flow evaluate <run_id> [--force] | compare <run_id> [<base_run_id>] | "
+             "report <run_id> [<base_run_id>] [--save]")
     args = sys.argv[1:]
-    if len(args) < 2 or args[0] not in ("evaluate", "compare"):
+    if len(args) < 2 or args[0] not in ("evaluate", "compare", "report"):
         sys.exit(usage)
+    ids = [a for a in args[1:] if not a.startswith("--")]
     if args[0] == "evaluate":
-        print(asyncio.run(hc_eval.evaluate_run(args[1], force="--force" in args)))
-    else:
-        result = asyncio.run(compare_runs(args[1], args[2] if len(args) > 2 else None))
+        print(asyncio.run(hc_eval.evaluate_run(ids[0], force="--force" in args)))
+    elif args[0] == "compare":
+        result = asyncio.run(compare_runs(ids[0], ids[1] if len(ids) > 1 else None))
         print(json.dumps(result.as_dict() if result else None, ensure_ascii=False, indent=1, default=str))
+    else:
+        print(asyncio.run(make_report(ids[0], ids[1] if len(ids) > 1 else None, save="--save" in args)))

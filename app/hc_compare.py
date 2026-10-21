@@ -44,6 +44,7 @@ class Row:
     source_captured: str | None = None
     failure_types: list[str] = field(default_factory=list)
     cost_usd: float = 0.0
+    reused: bool = False  # оцінку взято з попереднього прогону: той самий текст драфта, нових викликів не було
 
     @property
     def drafted(self) -> bool:
@@ -98,7 +99,7 @@ def summarize(rows: list[Row]) -> dict[str, Any]:
     out: dict[str, Any] = {"n": len(rows), "drafted": len(drafted), "refused": sum(r.draft == "refused" for r in rows),
                            "errors": sum(r.draft in ("error", "missing") for r in rows),
                            "flagged": sum(r.draft == "needs_manual_review" for r in rows), "judged": len(judged),
-                           "judge_errors": sum(r.eval == "ERROR" for r in rows),
+                           "judge_errors": sum(r.eval == "ERROR" for r in rows), "reused": sum(r.reused for r in rows),
                            "second_opinion": sum(r.eval == "SECOND_OPINION" for r in rows),
                            "coverage": _ratio(len(judged), len(drafted)),  # частка драфтів, що отримали оцінку
                            "refusal_rate": _ratio(sum(r.draft == "refused" for r in rows), len(rows)),
@@ -250,13 +251,15 @@ def load_rows(run_id: str, judge_key: str) -> list[Row]:
     with pg._connect() as c:
         rows = c.execute(
             """SELECT a.article_id, a.channel, a.title, a.url, coalesce(d.outcome, 'missing'), e.outcome, e.fact_safety,
-                      e.tier_a, e.tier_b, e.style, e.status, e.source_captured, e.failure_types, coalesce(e.cost_usd, 0)
+                      e.tier_a, e.tier_b, e.style, e.status, e.source_captured, e.failure_types, coalesce(e.cost_usd, 0),
+                      e.reused_from IS NOT NULL
                FROM hc_articles a
                LEFT JOIN hc_drafts d ON d.article_id = a.article_id AND d.run_id = %(run)s
                LEFT JOIN hc_evals e ON e.article_id = a.article_id AND e.run_id = %(run)s AND e.judge_key = %(key)s
                ORDER BY a.channel, a.article_id""", {"run": run_id, "key": judge_key}).fetchall()
     return [Row(article_id=r[0], channel=r[1], title=r[2], url=r[3], draft=r[4], eval=r[5], fact_safety=r[6], tier_a=r[7],
-                tier_b=r[8], style=r[9], status=r[10], source_captured=r[11], failure_types=r[12] or [], cost_usd=r[13])
+                tier_b=r[8], style=r[9], status=r[10], source_captured=r[11], failure_types=r[12] or [], cost_usd=r[13],
+                reused=bool(r[14]))
             for r in rows]
 
 

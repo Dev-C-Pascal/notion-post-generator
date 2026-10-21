@@ -13,9 +13,9 @@ from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
-from . import db, hc_compare, hc_eval, hc_flow, healthcheck, notion, pg, pipeline, status
+from . import db, hc_compare, hc_eval, hc_flow, hc_report, healthcheck, notion, pg, pipeline, status
 from .llm import get_model_client
 
 load_dotenv()
@@ -195,3 +195,28 @@ async def health_check_compare(run: str, base: str | None = None, judge: str | N
     if c is None:
         return {"run_id": run, "base_run": None, "note": "це перший завершений прогін: порівнювати нема з чим"}
     return c.as_dict()
+
+
+@app.get("/health-check/runs/{run_id}/report")
+async def health_check_report(run_id: str, base: str | None = None, judge: str | None = None,
+                              fresh: bool = False) -> Response:
+    """Звіт по прогону (markdown). Без параметрів — збережений ланцюжком після прогону; якщо його ще нема, а також з
+    ?fresh=true чи ?base=<run_id> — збирається на льоту: нічого не оцінює, не зберігає і не публікує."""
+    if not hc_compare.run_info(run_id):
+        raise HTTPException(status_code=404, detail="run not found")
+    stored = None if fresh or base else hc_report.get_report(run_id, judge)
+    markdown = stored["markdown"] if stored else await hc_flow.make_report(run_id, base, judge)
+    return Response(content=markdown, media_type="text/markdown; charset=utf-8")
+
+
+@app.post("/health-check/runs/{run_id}/report", status_code=202)
+async def health_check_report_rebuild(run_id: str, request: Request, background: BackgroundTasks) -> JSONResponse:
+    """Зібрати звіт наново, зберегти й опублікувати в Notion (NOTION_HEALTHCHECK_PAGE_ID). Дооцінює те, чого бракує,
+    тож може йти хвилини: результат — у GET цього ж шляху."""
+    _check_secret(request)
+    if not hc_compare.run_info(run_id):
+        raise HTTPException(status_code=404, detail="run not found")
+    if hc_flow.is_busy(run_id):
+        raise HTTPException(status_code=409, detail="кроки після цього прогону вже йдуть")
+    background.add_task(hc_flow.rebuild_report, run_id)
+    return JSONResponse(status_code=202, content={"run_id": run_id, "report": f"/health-check/runs/{run_id}/report"})
