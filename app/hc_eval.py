@@ -92,6 +92,11 @@ def fingerprint() -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:10]
 
 
+def current_judge_key(model: str | None = None) -> str:
+    """Ключ судді: оцінки з різним ключем не порівнюємо. Той самий, що в AnthropicJudge.key, але без клієнта і ключа API."""
+    return f"{model or JUDGE_MODEL}/{EFFORT}:{fingerprint()}"
+
+
 def system_blocks() -> list[anthropic.types.TextBlockParam]:
     """Інструкція Антона + вставка. Одна точка кешу після обох: решта 99 запитів читає їх із кешу за 0,1 ціни."""
     return [{"type": "text", "text": instruction()},
@@ -321,7 +326,7 @@ class AnthropicJudge:
 
     def __init__(self, api_key: str | None = None, *, model: str | None = None, client: Any = None):
         self.model = model or JUDGE_MODEL
-        self.key = f"{self.model}/{EFFORT}:{fingerprint()}"
+        self.key = current_judge_key(self.model)
         # Any: effort приходить зі змінної середовища (рядок), а SDK типізує його літералами; рантайм перевіряє сам API
         # timeout 300 с: Haiku пише 16k токенів за хвилини, а зависле з'єднання не має тримати весь Health Check
         self.client: Any = client or anthropic.Anthropic(api_key=api_key, max_retries=3, timeout=300)

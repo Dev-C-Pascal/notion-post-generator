@@ -27,3 +27,36 @@ def pgdb(monkeypatch):
     yield
     with psycopg.connect(url, autocommit=True) as c:
         c.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
+ARTICLES = [("a1", "fb"), ("a2", "fb"), ("x1", "x"), ("x2", "x")]
+
+
+@pytest.fixture
+def seed_run(pgdb):
+    """Фабрика прогонів для тестів зі справжньою базою. Еталонні статті (a1, a2 — fb; x1, x2 — x) засіваються один раз;
+    драфти прогону: a1 ok, a2 needs_manual_review, x1 refused, x2 error — оцінювати можна лише перші два."""
+    import json
+
+    from app import healthcheck, pg
+
+    def seed(run_id="hc-1", *, started_at=None, status="done", texts=None, extraction=None,
+             model="runpod-ep:draft_grounded"):
+        texts = texts or {}
+        healthcheck.init_db()
+        with pg._connect() as c:
+            for aid, ch in ARTICLES:
+                c.execute("INSERT INTO hc_articles (article_id, channel, url, title, text, source, published_at) "
+                          "VALUES (%s, %s, %s, %s, %s, 'Kyiv Post', '2026-10-01') ON CONFLICT DO NOTHING",
+                          (aid, ch, f"https://x/{aid}", f"Title {aid}", f"Текст статті {aid}"))
+            c.execute("INSERT INTO hc_runs (run_id, trigger, model_version, status, started_at) "
+                      "VALUES (%s, 'manual', %s, %s, coalesce(%s::timestamptz, now()))", (run_id, model, status, started_at))
+            for aid, outcome in (("a1", "ok"), ("a2", "needs_manual_review"), ("x1", "refused"), ("x2", "error")):
+                has_text = outcome in ("ok", "needs_manual_review")
+                c.execute("INSERT INTO hc_drafts (run_id, article_id, outcome, lang, text, extraction) "
+                          "VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
+                          (run_id, aid, outcome, "uk" if has_text else None,
+                           texts.get(aid, f"Пост {aid}") if has_text else None,
+                           json.dumps(extraction or {}) if has_text else None))
+
+    return seed

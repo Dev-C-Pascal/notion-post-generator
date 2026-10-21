@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import db, hc_eval, hc_flow, healthcheck, notion, pg, pipeline, status
+from . import db, hc_compare, hc_eval, hc_flow, healthcheck, notion, pg, pipeline, status
 from .llm import get_model_client
 
 load_dotenv()
@@ -182,3 +182,16 @@ def health_check_evals(run_id: str, judge: str | None = None) -> list:
     if not healthcheck.get_run(run_id):
         raise HTTPException(status_code=404, detail="run not found")
     return hc_eval.list_evals(run_id, judge)
+
+
+@app.get("/health-check/compare")
+async def health_check_compare(run: str, base: str | None = None, judge: str | None = None) -> dict:
+    """Порівняння прогону `run` з `base` (за замовчуванням — попередній завершений) оцінками одного судді (`judge`,
+    за замовчуванням — поточний). Нічого не оцінює і не коштує грошей: що не оцінено, те в warnings."""
+    for rid in (run, base):
+        if rid and not hc_compare.run_info(rid):
+            raise HTTPException(status_code=404, detail=f"run {rid} not found")
+    c = await hc_flow.compare_runs(run, base, judge)
+    if c is None:
+        return {"run_id": run, "base_run": None, "note": "це перший завершений прогін: порівнювати нема з чим"}
+    return c.as_dict()

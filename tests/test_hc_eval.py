@@ -280,28 +280,6 @@ def test_enabled_needs_key_and_switch(monkeypatch):
 
 # ---------- запис і прогін оцінки (справжній Postgres) ----------
 
-ARTICLES = [("a1", "fb"), ("a2", "fb"), ("x1", "x"), ("x2", "x")]
-
-
-def _seed(run_id="hc-1", texts=None, extraction=None):
-    """4 статті; драфти: a1 ok, a2 needs_manual_review, x1 refused, x2 error — оцінювати можна лише перші два."""
-    texts = texts or {}
-    healthcheck.init_db()
-    with pg._connect() as c:
-        for aid, ch in ARTICLES:
-            c.execute("INSERT INTO hc_articles (article_id, channel, url, title, text, source, published_at) "
-                      "VALUES (%s, %s, %s, %s, %s, 'Kyiv Post', '2026-10-01') ON CONFLICT DO NOTHING",
-                      (aid, ch, f"https://x/{aid}", f"Title {aid}", f"Текст статті {aid}"))
-        c.execute("INSERT INTO hc_runs (run_id, trigger, model_version, status) "
-                  "VALUES (%s, 'manual', 'runpod-ep:draft_grounded', 'done')", (run_id,))
-        for aid, outcome in (("a1", "ok"), ("a2", "needs_manual_review"), ("x1", "refused"), ("x2", "error")):
-            has_text = outcome in ("ok", "needs_manual_review")
-            c.execute("INSERT INTO hc_drafts (run_id, article_id, outcome, lang, text, extraction) "
-                      "VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
-                      (run_id, aid, outcome, "uk" if has_text else None, texts.get(aid, f"Пост {aid}") if has_text else None,
-                       json.dumps(extraction or {}) if has_text else None))
-
-
 class FakeJudge:
     key = "claude-haiku-5-5/medium:test"
 
@@ -325,8 +303,8 @@ def test_schema_is_in_step_with_columns(pgdb):
     assert cols == set(hc_eval.COLS) | {"created_at"}
 
 
-def test_pending_cases_take_only_drafts_with_text_and_not_yet_judged(pgdb):
-    _seed(extraction={"facts_used": [{"claim": "c", "verbatim_quote": "q"}]})
+def test_pending_cases_take_only_drafts_with_text_and_not_yet_judged(seed_run):
+    seed_run(extraction={"facts_used": [{"claim": "c", "verbatim_quote": "q"}]})
     cases = hc_eval.pending_cases("hc-1", "k1")
     assert [(c.article_id, c.draft_outcome, c.lang, c.channel) for c in cases] == [("a1", "ok", "uk", "fb"),
                                                                                  ("a2", "needs_manual_review", "uk", "fb")]
@@ -341,8 +319,8 @@ def test_pending_cases_take_only_drafts_with_text_and_not_yet_judged(pgdb):
     assert [c.article_id for c in hc_eval.pending_cases("hc-1", "k1")] == ["a2"]  # ERROR повторюємо
 
 
-async def test_evaluate_run_stores_everything_and_judges_the_first_draft_alone(pgdb):
-    _seed()
+async def test_evaluate_run_stores_everything_and_judges_the_first_draft_alone(seed_run):
+    seed_run()
     judge = FakeJudge({"a2": REPLY.replace("style: 3", "style: 5").replace("tier_a: 1", "tier_a: 0")
                        .replace("fact_safety: not ok", "fact_safety: ok")})
     summary = await hc_eval.evaluate_run("hc-1", judge)
@@ -359,8 +337,8 @@ async def test_evaluate_run_stores_everything_and_judges_the_first_draft_alone(p
     assert hc_eval.list_evals("hc-1", "інший-ключ") == []
 
 
-async def test_evaluate_run_resumes_and_does_not_pay_twice(pgdb):
-    _seed()
+async def test_evaluate_run_resumes_and_does_not_pay_twice(seed_run):
+    seed_run()
     first = FakeJudge({"a2": RuntimeError("мережа")})
     summary = await hc_eval.evaluate_run("hc-1", first)
     assert summary["outcomes"] == {"EVALUATED": 1, "ERROR": 1}
@@ -375,8 +353,8 @@ async def test_evaluate_run_resumes_and_does_not_pay_twice(pgdb):
     assert sorted(again.calls) == ["a1", "a2", "a2"]
 
 
-async def test_unparsable_answer_is_stored_as_error_with_raw_text(pgdb):
-    _seed()
+async def test_unparsable_answer_is_stored_as_error_with_raw_text(seed_run):
+    seed_run()
     await hc_eval.evaluate_run("hc-1", FakeJudge({"a1": "Вибач, не можу оцінити цей текст."}))
     with pg._connect() as c:
         outcome, error, raw, cost = c.execute(
@@ -384,11 +362,11 @@ async def test_unparsable_answer_is_stored_as_error_with_raw_text(pgdb):
     assert outcome == "ERROR" and "ParseError" in error and raw == "Вибач, не можу оцінити цей текст." and cost > 0
 
 
-async def test_same_draft_text_is_not_judged_again_in_a_later_run(pgdb):
-    _seed(texts={"a1": "Той самий пост", "a2": "Інший пост"})
+async def test_same_draft_text_is_not_judged_again_in_a_later_run(seed_run):
+    seed_run(texts={"a1": "Той самий пост", "a2": "Інший пост"})
     judge = FakeJudge()
     await hc_eval.evaluate_run("hc-1", judge)
-    _seed(run_id="hc-2", texts={"a1": "Той самий пост", "a2": "a2 тепер переписано"})
+    seed_run(run_id="hc-2", texts={"a1": "Той самий пост", "a2": "a2 тепер переписано"})
     second = FakeJudge()
     summary = await hc_eval.evaluate_run("hc-2", second)
     assert second.calls == ["a2"] and summary["outcomes"] == {"REUSED": 1, "EVALUATED": 1}
@@ -398,8 +376,8 @@ async def test_same_draft_text_is_not_judged_again_in_a_later_run(pgdb):
     assert reused == ("hc-1", 0.0, 0, "not ok")
 
 
-async def test_fatal_judge_error_stops_the_whole_evaluation(pgdb):
-    _seed()
+async def test_fatal_judge_error_stops_the_whole_evaluation(seed_run):
+    seed_run()
     judge = FakeJudge({"a1": hc_eval.JudgeFatal("AuthenticationError: invalid x-api-key")})
     with pytest.raises(hc_eval.JudgeFatal, match="invalid x-api-key"):
         await hc_eval.evaluate_run("hc-1", judge)
