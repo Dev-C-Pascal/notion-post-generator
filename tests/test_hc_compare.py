@@ -149,12 +149,14 @@ async def test_load_rows_joins_drafts_with_the_judges_verdicts(seed_run):
     seed_run("hc-1")
     key = "claude-haiku-5-5/medium:test"
     assert cmp.pending_evals("hc-1", key) == 2  # a1 і a2 мають текст
+    assert cmp.pending_evals("hc-1", key, retry_errors=False) == 2
     first, second = hc_eval.pending_cases("hc-1", key)
     hc_eval.save_eval(hc_eval._row(first, key, outcome="EVALUATED", fact_safety="ok", tier_a=0, tier_b=1, style=4,
                                    failure_types=["weak structure"], status="Approved after edit", source_captured="yes",
                                    cost_usd=0.002))
     hc_eval.save_eval(hc_eval._row(second, key, outcome="ERROR", error="boom"))
-    assert cmp.pending_evals("hc-1", key) == 1  # ERROR оцінкою не вважається
+    assert cmp.pending_evals("hc-1", key) == 1  # ERROR оцінкою не вважається...
+    assert cmp.pending_evals("hc-1", key, retry_errors=False) == 0  # ...але автоматичний супровід його не повторює
     rows = {r.article_id: r for r in cmp.load_rows("hc-1", key)}
     assert sorted(rows) == ["a1", "a2", "x1", "x2"] and rows["a1"].channel == "fb" and rows["a1"].title == "Title a1"
     a1 = rows["a1"]

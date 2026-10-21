@@ -167,6 +167,12 @@ def test_fact_safety_follows_tier_a_rule_not_the_models_word():
     assert hc_eval.parse_verdict(so).fact_safety == "not ok"
 
 
+def test_parse_finds_the_outcome_among_extra_words():
+    for written in ("EVALUATED (dry)", "evaluated", "`SECOND OPINION`", "outcome: SECOND_OPINION."):
+        raw = f"RESULT\noutcome: {written}\nstyle: 3\n"
+        assert hc_eval.parse_verdict(raw).outcome == ("SECOND_OPINION" if "SECOND" in written.upper() else "EVALUATED")
+
+
 def test_parse_flags_incomplete_evaluation():
     v = hc_eval.parse_verdict("RESULT\noutcome: EVALUATED\nrelevance: yes\n")
     assert v.problems == ["EVALUATED без fact_safety", "EVALUATED без style"]

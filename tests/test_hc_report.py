@@ -9,7 +9,7 @@ os.environ.setdefault("RUNPOD_API_KEY", "test")
 os.environ.setdefault("COMMS_DATABASE_URL", "")
 
 import dataclasses  # noqa: E402
-from datetime import datetime, timezone  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -63,6 +63,15 @@ def test_report_shows_verdict_metrics_changes_and_caveats():
     assert "(точність)" in md and "прапорець мав 33%" in md
     assert f"- Суддя: `{KEY}`; оцінено 7 з 7 драфтів (100%)" in md and "p — точний знаковий тест" in md
     assert md.endswith("\n") and not md.endswith("\n\n")
+
+
+def test_times_are_shown_in_utc_whatever_the_database_session_zone_is():
+    kyiv = timezone(timedelta(hours=3))
+    run = {**RUN, "started_at": datetime(2026, 10, 8, 13, 0, tzinfo=kyiv),
+           "finished_at": datetime(2026, 10, 8, 2, 30, tzinfo=kyiv)}
+    md = hc_report.render(run, cmp.summarize_scopes(NEW), KEY)
+    assert "2026-10-08 10:00 UTC → 2026-10-07 23:30 UTC" in md
+    assert md.startswith("# Health Check · hc-2 · 2026-10-08")
 
 
 def test_first_run_report_has_no_comparison_columns():
@@ -173,12 +182,14 @@ def test_report_roundtrip_keeps_the_alert_state(pgdb, seed_run):
 
 
 async def test_make_report_compares_with_the_previous_run_and_stores_it(seed_run, monkeypatch):
+    for name in ("HEALTHCHECK_ERROR_WARN", "HEALTHCHECK_ERROR_CRIT"):  # у засіяних даних 1 з 4 статей без відповіді моделі
+        monkeypatch.setenv(name, "1")  # — це окрема тема (hc_alert); тут перевіряємо звіт
     seed_run("hc-1", started_at="2026-10-01T10:00:00Z", model="runpod-old:draft_grounded")
     seed_run("hc-2", started_at="2026-10-08T10:00:00Z", model="runpod-new:draft_grounded")
     assert await hc_flow.make_report("нема") is None
+    _judge("hc-1", {"a1": ("ok", 4), "a2": ("not ok", 2)})
     first = await hc_flow.make_report("hc-1")  # перший прогін: бази нема
     assert first and "Перший прогін" in first and "Попередній" not in first
-    _judge("hc-1", {"a1": ("ok", 4), "a2": ("not ok", 2)})
     _judge("hc-2", {"a1": ("not ok", 2), "a2": ("not ok", 2)})
     published = []
 
@@ -194,7 +205,11 @@ async def test_make_report_compares_with_the_previous_run_and_stores_it(seed_run
     await hc_flow.make_report("hc-2", save=True)
     saved = hc_report.get_report("hc-2")
     assert saved and saved["base_run"] == "hc-1" and saved["baseline_run"] is None and saved["markdown"] == md
-    assert saved["notion_url"] == "https://www.notion.so/r" and published == [("hc-2", None)]
+    assert saved["notion_url"] == "https://www.notion.so/r" and published == [("hc-2", "ok")]
+    await hc_flow.make_report("hc-2", save=True)  # перебудова звіту не плодить нових сторінок у Notion
+    assert len(published) == 1
+    await hc_flow.make_report("hc-2", save=True, republish=True)  # а навмисна — створює ще одну (стару не чіпає)
+    assert len(published) == 2
     # Notion недоступний — звіт усе одно збережено
     async def broken(run_id, markdown, level):
         raise RuntimeError("Notion 404")
@@ -225,8 +240,8 @@ def test_report_endpoints(monkeypatch):
 
     rebuilt = []
 
-    async def fake_rebuild(run_id):
-        rebuilt.append(run_id)
+    async def fake_rebuild(run_id, republish=False):
+        rebuilt.append((run_id, republish))
 
     monkeypatch.setattr(hc_flow, "make_report", fake_make)
     monkeypatch.setattr(hc_flow, "rebuild_report", fake_rebuild)
@@ -243,9 +258,10 @@ def test_report_endpoints(monkeypatch):
         assert c.post("/health-check/runs/нема/report", headers=secret).status_code == 404
         r = c.post("/health-check/runs/hc-2/report", headers=secret)
         assert (r.status_code, r.json()["report"]) == (202, "/health-check/runs/hc-2/report")
+        assert c.post("/health-check/runs/hc-2/report?republish=true", headers=secret).status_code == 202
         monkeypatch.setattr(hc_flow, "is_busy", lambda rid: True)
         assert c.post("/health-check/runs/hc-2/report", headers=secret).status_code == 409
-    assert rebuilt == ["hc-2"]
+    assert rebuilt == [("hc-2", False), ("hc-2", True)]
 
 
 @pytest.mark.parametrize("judge, evaluate_missing, key", [(None, True, None), ("свій", False, "свій")])

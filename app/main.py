@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
-from . import db, hc_compare, hc_eval, hc_flow, hc_report, healthcheck, notion, pg, pipeline, status
+from . import db, hc_alert, hc_compare, hc_eval, hc_flow, hc_report, healthcheck, notion, pg, pipeline, status
 from .llm import get_model_client
 
 load_dotenv()
@@ -46,6 +46,8 @@ async def _startup() -> None:
         log.info("drafts Postgres ready")
         if healthcheck.EVERY_DAYS:
             app.state.healthcheck_schedule = asyncio.create_task(healthcheck.schedule_loop())
+        if hc_eval.enabled():  # деплой міг обірвати оцінку чи звіт останнього прогону — дозавершити
+            app.state.healthcheck_followup = asyncio.create_task(hc_flow.resume_followups())
     log.info("DBs ready: %s, %s; target Notion DB=%s", db.ARTICLES_DB, db.RUNS_DB, DATABASE_ID)
     status.restarted()  # у блоці статусу міг лишитись «генерується» від обірваних прогонів
 
@@ -210,13 +212,23 @@ async def health_check_report(run_id: str, base: str | None = None, judge: str |
 
 
 @app.post("/health-check/runs/{run_id}/report", status_code=202)
-async def health_check_report_rebuild(run_id: str, request: Request, background: BackgroundTasks) -> JSONResponse:
-    """Зібрати звіт наново, зберегти й опублікувати в Notion (NOTION_HEALTHCHECK_PAGE_ID). Дооцінює те, чого бракує,
-    тож може йти хвилини: результат — у GET цього ж шляху."""
+async def health_check_report_rebuild(run_id: str, request: Request, background: BackgroundTasks,
+                                      republish: bool = False) -> JSONResponse:
+    """Зібрати звіт наново й зберегти. Дооцінює те, чого бракує, тож може йти хвилини: результат — у GET цього ж шляху.
+    Сторінку в Notion (NOTION_HEALTHCHECK_PAGE_ID) створює лише якщо її для цього прогону ще нема; ?republish=true —
+    навмисно ще одну (стару бекенд не чіпає)."""
     _check_secret(request)
     if not hc_compare.run_info(run_id):
         raise HTTPException(status_code=404, detail="run not found")
     if hc_flow.is_busy(run_id):
         raise HTTPException(status_code=409, detail="кроки після цього прогону вже йдуть")
-    background.add_task(hc_flow.rebuild_report, run_id)
+    background.add_task(hc_flow.rebuild_report, run_id, republish)
     return JSONResponse(status_code=202, content={"run_id": run_id, "report": f"/health-check/runs/{run_id}/report"})
+
+
+@app.post("/health-check/alert-test")
+async def health_check_alert_test(request: Request) -> dict:
+    """Перевірити, що алерти доходять: надсилає тестове повідомлення в налаштовані канали (див. .env.example)."""
+    _check_secret(request)
+    sent = await hc_alert.send("🧪 Тест Health Check: якщо ви бачите це повідомлення, алерти доходять.", level="test")
+    return {"channels": hc_alert.channels(), "sent": sent}

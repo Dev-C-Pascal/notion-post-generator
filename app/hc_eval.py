@@ -238,9 +238,10 @@ def parse_verdict(raw: str) -> Verdict:
     if "RESULT" not in sections:
         raise ParseError("у відповіді немає блоку RESULT")
     f = _fields(sections["RESULT"])
-    outcome = (_none(f.get("outcome")) or "").upper().replace(" ", "_")
-    if outcome not in OUTCOMES:
+    found = re.search("|".join(OUTCOMES), (_none(f.get("outcome")) or "").upper().replace(" ", "_"))  # «EVALUATED (dry)» теж
+    if not found:
         raise ParseError(f"невідомий outcome: {f.get('outcome')!r}")
+    outcome = found.group()
     v = Verdict(outcome=outcome)
     v.relevance = _choice(f.get("relevance"), ("yes", "no"))
     v.fact_safety = _choice(f.get("fact_safety"), ("ok", "not ok"))

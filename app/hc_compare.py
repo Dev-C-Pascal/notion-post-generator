@@ -270,16 +270,24 @@ def run_info(run_id: str) -> dict[str, Any] | None:
     return dict(zip(("run_id", "trigger", "model_version", "status", "started_at", "finished_at"), r, strict=True)) if r else None
 
 
-def pending_evals(run_id: str, judge_key: str) -> int:
-    """Скільки драфтів прогону ще без успішної оцінки цього судді (0 — оцінку завершено)."""
+def pending_evals(run_id: str, judge_key: str, *, retry_errors: bool = True) -> int:
+    """Скільки драфтів прогону ще без оцінки цього судді. retry_errors: чи вважати недоробленими ті, де суддя збоїв
+    (ERROR) — для порівняння так, а для автоматичного супроводу ні: інакше суддя, що стабільно не віддає розбірливої
+    відповіді, змушував би щогодини платити за ті самі виклики."""
     with pg._connect() as c:
         r = c.execute(
             """SELECT count(*) FROM hc_drafts d
-               LEFT JOIN hc_evals e ON e.run_id = d.run_id AND e.article_id = d.article_id AND e.judge_key = %s
-                                   AND e.outcome <> 'ERROR'
-               WHERE d.run_id = %s AND d.outcome IN ('ok', 'needs_manual_review') AND coalesce(d.text, '') <> ''
-                 AND e.article_id IS NULL""", (judge_key, run_id)).fetchone()
+               LEFT JOIN hc_evals e ON e.run_id = d.run_id AND e.article_id = d.article_id AND e.judge_key = %(key)s
+                                   AND (NOT %(retry)s OR e.outcome <> 'ERROR')
+               WHERE d.run_id = %(run)s AND d.outcome IN ('ok', 'needs_manual_review') AND coalesce(d.text, '') <> ''
+                 AND e.article_id IS NULL""", {"key": judge_key, "run": run_id, "retry": retry_errors}).fetchone()
     return int(r[0]) if r else 0
+
+
+def latest_run(status: str = "done") -> str | None:
+    with pg._connect() as c:
+        r = c.execute("SELECT run_id FROM hc_runs WHERE status = %s ORDER BY started_at DESC LIMIT 1", (status,)).fetchone()
+    return r[0] if r else None
 
 
 def previous_run(run_id: str) -> str | None:

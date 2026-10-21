@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from . import notion, pg
@@ -82,7 +82,7 @@ def delta_text(d: MetricDelta) -> str:
 
 
 def p_text(d: MetricDelta) -> str:
-    return "—" if d.p is None else num(d.p)
+    return "—" if d.p is None else "<0,01" if d.p < 0.01 else num(d.p)
 
 
 def value(key: str, v: float | None) -> str:
@@ -95,7 +95,7 @@ def _clean(text: str) -> str:
 
 
 def _when(dt: datetime | None) -> str:
-    return "—" if dt is None else dt.strftime("%Y-%m-%d %H:%M UTC")
+    return "—" if dt is None else dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def table(header: list[str], rows: list[list[str]]) -> list[str]:
