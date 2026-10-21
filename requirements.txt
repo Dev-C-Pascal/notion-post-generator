@@ -4,3 +4,4 @@ httpx
 python-dotenv
 pydantic
 psycopg[binary]
+anthropic>=2,<3

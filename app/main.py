@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import db, healthcheck, notion, pg, pipeline, status
+from . import db, hc_eval, hc_flow, healthcheck, notion, pg, pipeline, status
 from .llm import get_model_client
 
 load_dotenv()
@@ -152,3 +152,33 @@ def health_check_run(run_id: str) -> dict:
     if not r:
         raise HTTPException(status_code=404, detail="run not found")
     return r
+
+
+@app.post("/health-check/runs/{run_id}/evaluate", status_code=202)
+async def health_check_evaluate(run_id: str, request: Request, background: BackgroundTasks) -> JSONResponse:
+    """Оцінити драфти прогону агентом-оцінювачем (інструкція Антона, дешева модель Anthropic). Тіло (необов'язково):
+    {"force": true} — оцінити заново, {"judge_model": "..."} — іншою моделлю; оцінки різних суддів лежать окремо."""
+    _check_secret(request)
+    if not healthcheck.get_run(run_id):
+        raise HTTPException(status_code=404, detail="run not found")
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    try:
+        judge = hc_eval.get_judge(body.get("judge_model"))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if hc_flow.is_busy(run_id):
+        raise HTTPException(status_code=409, detail="оцінка цього прогону вже йде")
+    background.add_task(hc_flow.after_run, run_id, judge=judge, force=bool(body.get("force")))
+    return JSONResponse(status_code=202, content={"run_id": run_id, "judge": judge.key})
+
+
+@app.get("/health-check/runs/{run_id}/evals")
+def health_check_evals(run_id: str, judge: str | None = None) -> list:
+    """Оцінки по статтях (без сирих відповідей судді); ?judge=<ключ> — лише одного судді."""
+    if not healthcheck.get_run(run_id):
+        raise HTTPException(status_code=404, detail="run not found")
+    return hc_eval.list_evals(run_id, judge)

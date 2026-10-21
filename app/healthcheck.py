@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from . import comms, notion, pg, pipeline
+from . import comms, hc_eval, notion, pg, pipeline
 from .llm import GroundingRefused, ModelClient, RunPodModelClient
 from .models import Article, Draft
 
@@ -148,6 +148,8 @@ async def build_reference_set(per_channel: int = PER_CHANNEL) -> dict[str, int]:
 def init_db() -> None:
     with pg._connect() as c:
         c.execute(SCHEMA)
+    hc_eval.init_db()  # оцінки посилаються на hc_runs і hc_articles, тож після них
+    with pg._connect() as c:
         # прогін, що йшов під час деплою/перезапуску, уже ніхто не допише сам — лише {"resume": run_id}
         c.execute("UPDATE hc_runs SET status = 'interrupted', finished_at = now() WHERE status = 'running'")
 
@@ -313,6 +315,9 @@ async def run(run_id: str, model: ModelClient) -> None:
         outcomes = [str(r) for r in results]
         finish_run(run_id, "done")
         log.info("health check %s готово: %s", run_id, {o: outcomes.count(o) for o in set(outcomes)})
+        if hc_eval.enabled():  # оцінка → порівняння → звіт → алерт; збій тут прогін уже не ламає
+            from . import hc_flow  # локально: hc_flow читає прогони з цього модуля
+            await hc_flow.after_run(run_id)
     except Exception as e:
         log.exception("health check %s failed", run_id)
         finish_run(run_id, "failed", f"{type(e).__name__}: {e}"[:500])
