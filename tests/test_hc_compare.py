@@ -200,13 +200,18 @@ async def test_compare_runs_pairs_a_run_with_the_previous_one(seed_run):
     assert explicit and explicit.delta("fact_ok_rate").worse == 1
 
 
-async def test_compare_warns_when_the_judge_has_not_scored_everything(seed_run, monkeypatch):
+async def test_compare_warns_when_the_judge_has_not_scored_everything(seed_run):
     seed_run("hc-1", started_at="2026-10-01T10:00:00Z")
     seed_run("hc-2", started_at="2026-10-08T10:00:00Z")
     _judge("hc-1", {"a1": ("ok", 4), "a2": ("ok", 4)})
     c = await hc_flow.compare_runs("hc-2")  # hc-2 цим суддею ще не оцінений
     assert c and any("hc-2: 2 драфтів без оцінки" in w for w in c.warnings)
     assert any("hc-2: оцінено лише 0%" in w for w in c.warnings) and not any("hc-1:" in w for w in c.warnings)
+
+
+async def test_the_chain_scores_what_the_judge_has_not_seen_once_per_run(seed_run, monkeypatch):
+    for i, day in enumerate(("01", "08", "15"), 1):
+        seed_run(f"hc-{i}", started_at=f"2026-10-{day}T10:00:00Z")
     evaluated = []
 
     async def fake_evaluate(run_id, judge=None, **kw):
@@ -215,10 +220,12 @@ async def test_compare_warns_when_the_judge_has_not_scored_everything(seed_run, 
         return {}
 
     monkeypatch.setattr(hc_eval, "evaluate_run", fake_evaluate)
-    done = await hc_flow.compare_runs("hc-2", evaluate_missing=True)  # ланцюжок дооцінює те, чого бракує
-    assert evaluated == ["hc-2"] and done and done.warnings == []
-    await hc_flow.compare_runs("hc-2", judge_key="чужий-суддя", evaluate_missing=True)
-    assert evaluated == ["hc-2"]  # чужого суддю не підміняємо: дооцінки не буде
+    md = await hc_flow.make_report("hc-3", evaluate_missing=True)  # попередній hc-2, еталонний hc-1: усі без оцінок
+    assert sorted(evaluated) == ["hc-1", "hc-2", "hc-3"] and md and "Попередній (hc-2)" in md and "База (hc-1)" in md
+    await hc_flow.make_report("hc-3", evaluate_missing=True)  # усе оцінено — вдруге не платимо
+    assert len(evaluated) == 3
+    await hc_flow.make_report("hc-3", judge_key="чужий-суддя", evaluate_missing=True)  # чужого суддю не підміняємо
+    assert len(evaluated) == 3
 
 
 def test_compare_endpoint(monkeypatch):

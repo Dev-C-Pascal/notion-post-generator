@@ -1,6 +1,6 @@
 """Health Check після прогону: оцінка драфтів → порівняння → звіт → алерт. Кроки йдуть підряд, кожен можна запустити окремо
 (POST-ендпоінти в main.py або `python -m app.hc_flow <крок> <run_id>`); кожен пише результат у postgen одразу, тож обрив
-деплоєм не губить зроблене, а повторний виклик дододає решту.
+деплоєм не губить зроблене, а повторний виклик дооцінює решту.
 
 after_run не кидає винятків: прогін моделі на цей момент уже done, і збій оцінки (немає ключа Anthropic, ліміт, мережа)
 не має перетворювати його на failed.
@@ -79,19 +79,14 @@ async def rebuild_report(run_id: str, republish: bool = False) -> None:
         _busy.discard(run_id)
 
 
-async def compare_runs(run_id: str, base_id: str | None = None, judge_key: str | None = None, *,
-                       evaluate_missing: bool = False) -> hc_compare.Comparison | None:
+async def compare_runs(run_id: str, base_id: str | None = None, judge_key: str | None = None
+                       ) -> hc_compare.Comparison | None:
     """Порівняти прогін з базою (за замовчуванням — попередній завершений) оцінками одного судді. None — порівнювати
-    нема з чим: це перший завершений прогін. evaluate_missing: дооцінити бази й прогін поточним суддею (платно, але
-    дешево: тексти драфтів уже в базі) — так робить ланцюжок після прогону; GET-ендпоінт цього не робить."""
+    нема з чим: це перший завершений прогін. Нічого не оцінює й нічого не коштує: що не оцінено, те в warnings."""
     base_id = base_id or hc_compare.previous_run(run_id)
     if not base_id:
         return None
     key = judge_key or hc_eval.current_judge_key()
-    if evaluate_missing and judge_key is None:
-        for rid in (base_id, run_id):
-            if hc_compare.pending_evals(rid, key):
-                await hc_eval.evaluate_run(rid)
     c = hc_compare.compare(base_id, hc_compare.load_rows(base_id, key), run_id, hc_compare.load_rows(run_id, key))
     c.meta = {"base": hc_compare.run_info(base_id), "new": hc_compare.run_info(run_id), "judge": key}
     for rid in (base_id, run_id):
@@ -115,11 +110,17 @@ async def make_report(run_id: str, base_id: str | None = None, judge_key: str | 
     if not run:
         return None
     key = judge_key or hc_eval.current_judge_key()
-    prev = await compare_runs(run_id, base_id, judge_key, evaluate_missing=evaluate_missing)
-    baseline_id = hc_compare.baseline_run(run_id)
+    prev_id, baseline_id = base_id or hc_compare.previous_run(run_id), hc_compare.baseline_run(run_id)
+    if evaluate_missing and judge_key is None:
+        # поточним суддею дооцінюємо те, що він ще не бачив (зміна моделі чи промпта судді, обірвана оцінка), по разу
+        # на прогін; драфти, де він уже збоїв, тут не повторюємо — це платно й нічого не змінить
+        for rid in dict.fromkeys(r for r in (prev_id, baseline_id, run_id) if r):
+            if hc_compare.pending_evals(rid, key, retry_errors=False):
+                await hc_eval.evaluate_run(rid)
+    prev = await compare_runs(run_id, prev_id, judge_key)
     baseline = None
-    if baseline_id and (prev is None or baseline_id != prev.base_run):
-        baseline = await compare_runs(run_id, baseline_id, judge_key, evaluate_missing=evaluate_missing)
+    if baseline_id and baseline_id != prev_id:
+        baseline = await compare_runs(run_id, baseline_id, judge_key)
     ref = prev or baseline
     summary = ref.new if ref else hc_compare.summarize_scopes(hc_compare.load_rows(run_id, key))
     health = hc_alert.assess(prev, baseline, summary)  # без бази й без збоїв це «info»: перший прогін сам стає базою
@@ -136,8 +137,7 @@ async def make_report(run_id: str, base_id: str | None = None, judge_key: str | 
                               baseline_run=baseline.base_run if baseline else None, level=health.level,
                               reasons=health.reasons, notion_url=url)
         try:
-            stored = hc_report.get_report(run_id, key)
-            await hc_alert.deliver(run_id, key, health, run, url or (stored["notion_url"] if stored else None))
+            await hc_alert.deliver(run_id, key, health, run, url)
         except Exception:
             log.exception("health check %s: алерт не надіслано", run_id)
     return markdown

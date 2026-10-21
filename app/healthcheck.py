@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from . import comms, hc_alert, hc_eval, hc_report, notion, pg, pipeline
+from . import comms, hc_alert, hc_eval, hc_flow, hc_report, notion, pg, pipeline
 from .llm import GroundingRefused, ModelClient, RunPodModelClient
 from .models import Article, Draft
 
@@ -317,7 +317,6 @@ async def run(run_id: str, model: ModelClient) -> None:
         finish_run(run_id, "done")
         log.info("health check %s готово: %s", run_id, {o: outcomes.count(o) for o in set(outcomes)})
         if hc_eval.enabled():  # оцінка → порівняння → звіт → алерт; збій тут прогін уже не ламає
-            from . import hc_flow  # локально: hc_flow читає прогони з цього модуля
             await hc_flow.after_run(run_id)
     except Exception as e:
         log.exception("health check %s failed", run_id)
@@ -351,7 +350,6 @@ async def schedule_loop() -> None:
                 _tasks.add(task)
                 task.add_done_callback(_tasks.discard)
             elif not _current:  # нового прогону не треба — дозавершити оцінку й звіт останнього, якщо їх обірвано
-                from . import hc_flow
                 await hc_flow.resume_followups()
         except Exception:
             log.exception("health check: розклад")
