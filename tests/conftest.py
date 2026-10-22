@@ -1,7 +1,9 @@
 """Спільне для тестів: платні й зовнішні речі вимкнені, справжній Postgres — лише коли заданий TEST_DATABASE_URL."""
+import json
 import os
 import uuid
 
+import httpx
 import pytest
 
 
@@ -60,3 +62,19 @@ def seed_run(pgdb):
                            json.dumps(extraction or {}) if has_text else None))
 
     return seed
+
+
+@pytest.fixture
+def outbox(monkeypatch):
+    """Усі вихідні HTTP-запити повідомлень (Telegram, вебхук) йдуть у список requests; status і body — що відповідає
+    «сервер» (body — JSON-відповідь, напр. помилка Telegram)."""
+    sent: dict = {"requests": [], "status": 200, "body": None}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent["requests"].append((str(request.url), json.loads(request.content)))
+        return httpx.Response(sent["status"], json=sent["body"]) if sent["body"] is not None \
+            else httpx.Response(sent["status"])
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    return sent

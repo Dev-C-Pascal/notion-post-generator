@@ -15,7 +15,8 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
-from . import db, hc_alert, hc_compare, hc_eval, hc_flow, hc_report, healthcheck, notion, pg, pipeline, status
+from . import (db, hc_compare, hc_eval, hc_flow, hc_report, healthcheck, logsafe, notify, notion, pg, pipeline,
+               status)
 from .llm import get_model_client
 
 load_dotenv()
@@ -24,6 +25,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
     logging.StreamHandler(),
     RotatingFileHandler(db.DATA_DIR / "app.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"),
 ])
+logsafe.install()  # httpx пише в журнал адресу кожного запиту, а в Telegram токен бота стоїть у самій адресі
 log = logging.getLogger("post-generator")
 
 DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "").replace("-", "")
@@ -228,7 +230,10 @@ async def health_check_report_rebuild(run_id: str, request: Request, background:
 
 @app.post("/health-check/alert-test")
 async def health_check_alert_test(request: Request) -> dict:
-    """Перевірити, що алерти доходять: надсилає тестове повідомлення в налаштовані канали (див. .env.example)."""
+    """Перевірити, що повідомлення доходять: надсилає тестове в налаштовані канали (див. .env.example). Якщо канал не
+    відповів, у errors — причина без адреси й токена (напр. «Telegram: Bad Request: chat not found (400)»)."""
     _check_secret(request)
-    sent = await hc_alert.send("🧪 Тест Health Check: якщо ви бачите це повідомлення, алерти доходять.", level="test")
-    return {"channels": hc_alert.channels(), "sent": sent}
+    results = await notify.send_detailed("🧪 Тест Health Check: якщо ви бачите це повідомлення, сповіщення доходять.",
+                                         verdict="test")
+    return {"channels": notify.channels(), "sent": {k: v["ok"] for k, v in results.items()},
+            "errors": {k: v["error"] for k, v in results.items() if v["error"]}}

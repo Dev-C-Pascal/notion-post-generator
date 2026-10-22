@@ -62,6 +62,11 @@ def _rich(text: str) -> list:
     return [{"text": {"content": text[i:i + TEXT_LIMIT]}} for i in range(0, max(len(text), 1), TEXT_LIMIT)]
 
 
+def rich_text(text: str) -> list:
+    """Значення title/rich_text для властивості рядка: текст, розбитий на фрагменти по 2000 символів."""
+    return _rich(text)
+
+
 async def get_page(page_id: str) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
         return await _send(client, "GET", f"{NOTION_API}/pages/{page_id}")
@@ -132,6 +137,15 @@ async def create_page(parent_page_id: str, title: str, blocks: list[dict]) -> di
             await _send(client, "PATCH", f"{NOTION_API}/blocks/{page['id']}/children",
                         json={"children": blocks[i:i + BLOCKS_LIMIT]})
     return page
+
+
+async def create_database(parent_page_id: str, title: str, properties: dict) -> dict:
+    """POST /v1/databases — нова таблиця під існуючою сторінкою (напр. «Health Check — прогони»). Лише створює: нічого, що
+    вже є в Notion, не змінює і не видаляє. properties — схема колонок (рівно одна з типом title)."""
+    payload = {"parent": {"type": "page_id", "page_id": parent_page_id}, "title": [{"type": "text", "text": {"content": title}}],
+               "properties": properties}
+    async with httpx.AsyncClient(timeout=30) as client:
+        return await _send(client, "POST", f"{NOTION_API}/databases", json=payload)
 
 
 async def append_body(page_id: str, body: str) -> dict:
