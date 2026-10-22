@@ -15,8 +15,21 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
-from . import (db, hc_compare, hc_eval, hc_flow, hc_report, healthcheck, logsafe, notify, notion, pg, pipeline,
-               status)
+from . import (
+    db,
+    hc_calibrate,
+    hc_compare,
+    hc_eval,
+    hc_flow,
+    hc_report,
+    healthcheck,
+    logsafe,
+    notify,
+    notion,
+    pg,
+    pipeline,
+    status,
+)
 from .llm import get_model_client
 
 load_dotenv()
@@ -125,8 +138,9 @@ async def webhook(request: Request, background: BackgroundTasks, channel: str | 
 # Health Check — лише з сервера (Caddy назовні не пускає): curl 127.0.0.1:8000/health-check …
 @app.post("/health-check", status_code=202)
 async def health_check_start(request: Request, background: BackgroundTasks) -> JSONResponse:
-    """Прогін еталонного набору. Тіло (необов'язково): {"endpoint_id": "...", "mode": "..."} — інша версія моделі;
-    {"resume": "<run_id>"} — догенерувати обірваний прогін тією ж моделлю."""
+    """Прогін еталонного набору. Тіло (необов'язково): {"note": "змінили промпт"} — чому запускаємо (потрапить у звіт,
+    рядок Notion і повідомлення); {"endpoint_id": "...", "mode": "..."} — інша версія моделі; {"resume": "<run_id>"} —
+    догенерувати обірваний прогін тією ж моделлю."""
     _check_secret(request)
     try:
         body = await request.json()
@@ -135,7 +149,8 @@ async def health_check_start(request: Request, background: BackgroundTasks) -> J
     body = body if isinstance(body, dict) else {}
     try:
         model = None if body.get("resume") else healthcheck.model_for(body.get("endpoint_id"), body.get("mode"))
-        run_id, model = healthcheck.start("manual", model, resume=body.get("resume"))
+        note = body.get("note") if isinstance(body.get("note"), str) else None
+        run_id, model = healthcheck.start("manual", model, resume=body.get("resume"), note=note)
     except healthcheck.AlreadyRunning as e:
         raise HTTPException(status_code=409, detail=f"health check {e} ще йде") from e
     except KeyError as e:
@@ -190,8 +205,9 @@ def health_check_evals(run_id: str, judge: str | None = None) -> list:
 
 @app.get("/health-check/compare")
 async def health_check_compare(run: str, base: str | None = None, judge: str | None = None) -> dict:
-    """Порівняння прогону `run` з `base` (за замовчуванням — попередній завершений) оцінками одного судді (`judge`,
-    за замовчуванням — поточний). Нічого не оцінює і не коштує грошей: що не оцінено, те в warnings."""
+    """Порівняння прогону `run` з `base` (за замовчуванням — останній успішний, як у вердикті; якщо вердиктів ще немає —
+    попередній завершений) оцінками одного судді (`judge`, за замовчуванням — поточний). Нічого не оцінює і не коштує
+    грошей: що не оцінено, те в warnings."""
     for rid in (run, base):
         if rid and not hc_compare.run_info(rid):
             raise HTTPException(status_code=404, detail=f"run {rid} not found")
@@ -237,3 +253,38 @@ async def health_check_alert_test(request: Request) -> dict:
                                          verdict="test")
     return {"channels": notify.channels(), "sent": {k: v["ok"] for k, v in results.items()},
             "errors": {k: v["error"] for k, v in results.items() if v["error"]}}
+
+
+@app.post("/health-check/calibration", status_code=202)
+async def health_check_calibration(request: Request, background: BackgroundTasks) -> JSONResponse:
+    """Звірка судді з людськими оцінками (пункт 4): зібрати пари з таблиці MVP, оцінити суддею те, чого він ще не бачив
+    (≈ 300 викликів, платно), звіт у Notion; збіг нижче цілі — повідомлення. Тіло (необов'язково): {"limit": N} — оцінити
+    лише N нових пар (спробувати на малому), {"collect": false} — не перезбирати пари з Notion. Результат — GET."""
+    _check_secret(request)
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    try:
+        judge = hc_eval.get_judge(body.get("judge_model"))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if hc_calibrate.is_busy():
+        raise HTTPException(status_code=409, detail="звірка вже йде")
+    limit = body.get("limit") if isinstance(body.get("limit"), int) and body["limit"] > 0 else None
+    background.add_task(hc_calibrate.run, judge, limit=limit, collect_first=body.get("collect", True) is not False)
+    return JSONResponse(status_code=202, content={"judge": judge.key, "limit": limit,
+                                                  "result": "/health-check/calibration"})
+
+
+@app.get("/health-check/calibration")
+def health_check_calibration_result(judge: str | None = None, format: str = "json") -> Response:
+    """Остання звірка судді (`judge`, за замовчуванням — поточний): збіг, ціль, метрики; ?format=markdown — звіт."""
+    found = hc_calibrate.latest(judge or hc_eval.current_judge_key())
+    if not found:
+        raise HTTPException(status_code=404, detail="звірки цього судді ще не було: POST /health-check/calibration")
+    if format == "markdown":
+        return Response(content=found["markdown"], media_type="text/markdown; charset=utf-8")
+    return JSONResponse(content={**{k: v for k, v in found.items() if k != "markdown"},
+                                 "running": hc_calibrate.is_busy(), "created_at": found["created_at"].isoformat()})

@@ -101,6 +101,8 @@ async def test_httpx_logs_the_telegram_url_and_the_filter_removes_the_token(tele
     raw, safe = io.StringIO(), io.StringIO()
     raw_handler, safe_handler = logging.StreamHandler(raw), logging.StreamHandler(safe)
     safe_handler.addFilter(logsafe.RedactFilter())
+    for h in root.handlers:  # фільтр, який поставив імпорт app.main в інших тестах, чистить запис для всіх обробників
+        monkeypatch.setattr(h, "filters", [f for f in h.filters if not isinstance(f, logsafe.RedactFilter)])
     old_level = root.level
     root.setLevel(logging.INFO)
     root.addHandler(raw_handler)

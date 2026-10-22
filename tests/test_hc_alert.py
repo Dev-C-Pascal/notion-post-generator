@@ -1,5 +1,5 @@
-"""Health Check, пункт 6: алерт — коли тривожити (поріг і значущість), як не дублювати, як доставляти й що робити зі збоєм
-самого Health Check."""
+"""Health Check, пункт 6: повідомлення після кожного прогону — текст, режим «лише збої», одне на вердикт, збій самого Health
+Check, супровід після перезапуску і наскрізний сценарій двох прогонів (модель → суддя → вердикт → Notion → повідомлення)."""
 import os
 
 os.environ.setdefault("NOTION_TOKEN", "secret_xxx")
@@ -13,241 +13,112 @@ import json  # noqa: E402
 import logging  # noqa: E402
 
 import anthropic  # noqa: E402
-import httpx  # noqa: E402
 import httpx2  # noqa: E402
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from test_hc_compare import _judge  # noqa: E402  (той самий модуль, що вже завантажив pytest)
 
-from app import hc_alert, hc_eval, hc_flow, hc_report, healthcheck  # noqa: E402
+from app import hc_alert, hc_eval, hc_flow, hc_report, hc_verdict, healthcheck, notify  # noqa: E402
 from app import hc_compare as cmp  # noqa: E402
 from app.hc_compare import Row  # noqa: E402
+from app.hc_verdict import BASELINE, FAILED, PASSED, UNKNOWN, Verdict  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Draft  # noqa: E402
 
 KEY = "claude-haiku-5-5/medium:test"
-RUN = {"run_id": "hc-2", "model_version": "runpod-new:draft_grounded"}
+RUN = {"run_id": "hc-2", "trigger": "manual", "model_version": "runpod-new:draft_grounded", "note": None}
+CHANNEL_VARS = ("HEALTHCHECK_ALERT_WEBHOOK", "HEALTHCHECK_ALERT_TELEGRAM_BOT_TOKEN", "HEALTHCHECK_ALERT_TELEGRAM_CHAT_ID",
+                "HEALTHCHECK_ALERT_TELEGRAM_THREAD_ID", "HEALTHCHECK_ALERT_MODE")
 
 
-def rows(fb_bad: int = 0, x_bad: int = 0, n: int = 20, *, style: int = 4, errors: int = 0, judged: bool = True,
-         shift: int = 0, no_draft_fb: int = 0) -> list[Row]:
-    """2n статей (n fb + n x): fb_bad / x_bad статей мають фейк (з номера shift), перші `errors` x-статей — збій моделі,
-    перші `no_draft_fb` fb-статей — відмова моделі."""
-    out = []
-    for ch, bad in (("fb", fb_bad), ("x", x_bad)):
-        for i in range(n):
-            if ch == "x" and i < errors:
-                out.append(Row(f"{ch}{i}", ch, draft="error"))
-                continue
-            if ch == "fb" and i < no_draft_fb:
-                out.append(Row(f"{ch}{i}", ch, draft="refused"))
-                continue
-            fake = shift <= i < shift + bad
-            out.append(Row(f"{ch}{i}", ch, title=f"T {ch}{i}", url=f"https://x/{ch}{i}", draft="ok",
-                           eval="EVALUATED" if judged else None, fact_safety="not ok" if fake else "ok" if judged else None,
-                           tier_a=int(fake) if judged else None, style=style if judged else None))
-    return out
-
-
-def compare(new: list[Row], base: list[Row] | None = None, base_run: str = "hc-1") -> cmp.Comparison:
-    return cmp.compare(base_run, base or rows(), "hc-2", new)
-
-
-def verdict(new: list[Row], base: list[Row] | None = None) -> hc_alert.Assessment:
-    c = compare(new, base)
-    return hc_alert.assess(c, None, c.new)
-
-
-# ---------- коли тривожити ----------
-
-def test_first_run_with_a_healthy_summary_is_just_info():
-    a = hc_alert.assess(None, None, cmp.summarize_scopes(rows()))
-    assert (a.level, a.findings, a.reasons) == ("info", [], [])
-
-
-def test_nothing_changed_is_ok():
-    assert verdict(rows()).level == "ok"
-
-
-def test_big_and_significant_drop_is_critical_and_names_the_numbers():
-    a = verdict(rows(6, 6))  # 12 з 40 статей втратили Fact ok: −30 п. п., p ≈ 0,0005
-    assert a.level == "critical"
-    assert a.reasons == [
-        "Fact safety = ok: 100% → 70% (−30 п. п., p = <0,01) відносно попереднього прогону hc-1",
-        "Fact safety = ok, FB: 100% → 70% (−30 п. п., p = 0,03) відносно попереднього прогону hc-1",
-        "Fact safety = ok, X: 100% → 70% (−30 п. п., p = 0,03) відносно попереднього прогону hc-1"]
-
-
-def test_moderate_significant_drop_is_a_warning_and_channels_need_more():
-    a = verdict(rows(3, 2))  # 5 з 40: −12,5 п. п., p = 0,06; у каналах 3/20 при p = 0,25 і 2/20 — замало
-    assert a.level == "warning"
-    assert a.reasons == ["Fact safety = ok: 100% → 88% (−12 п. п., p = 0,06) відносно попереднього прогону hc-1"]
-
-
-def test_noise_does_not_alert():
-    assert verdict(rows(2, 1)).level == "ok"  # 3 з 40 = 7,5 п. п. — нижче порога
-    big_but_random = verdict(rows(2, 1, n=10), rows(0, 0, n=10))  # 3 з 20 = 15 п. п., але p = 0,25: могло бути випадково
-    assert big_but_random.level == "ok"
-    swapped = compare(rows(4, 4, shift=4), rows(4, 4))  # 8 статей зіпсувались, ІНШІ 8 виправились: у середньому нічого
-    d = swapped.delta("fact_ok_rate")
-    assert (d.worse, d.better, d.delta) == (8, 8, 0) and d.p == 1.0
-    assert hc_alert.assess(swapped, None, swapped.new).level == "ok"
-
-
-def test_few_pairs_are_not_enough_to_judge():
-    a = verdict(rows(4, 4, n=4), rows(0, 0, n=4))  # 8 статей: −100 п. п. на кожному каналі, але пар менше за MIN_PAIRS
-    assert a.level == "ok"
-
-
-def test_style_drop_and_lost_drafts_alert_too():
-    a = verdict(rows(style=2))  # усі 40 статей: Style 4 → 2
-    assert a.level == "critical"
-    assert any(r.startswith("Style 4–5: 100% → 0% (−100 п. п.") for r in a.reasons)
-    assert any(r.startswith("Середній Style: 4,00 → 2,00 (−2,00") for r in a.reasons)
-    lost = verdict(rows(no_draft_fb=20))  # на всі 20 fb-статей модель тепер відмовляється
-    assert lost.level == "critical"
-    assert any(r.startswith("Модель дала драфт: 100% → 50% (−50 п. п.") for r in lost.reasons)
-
-
-def test_baseline_has_its_own_wording_and_both_comparisons_count():
-    prev, base = compare(rows()), compare(rows(6, 6), base_run="hc-0")
-    a = hc_alert.assess(prev, base, prev.new)
-    assert a.level == "critical" and a.reasons[0].endswith("відносно еталонного прогону hc-0")
-
-
-def test_thresholds_come_from_the_environment(monkeypatch):
-    c = compare(rows(3, 2))
-    monkeypatch.setenv("HEALTHCHECK_WARN_PP", "20")
-    assert hc_alert.assess(c, None, c.new).level == "ok"  # поріг підняли — п'ять статей уже не привід
-    monkeypatch.setenv("HEALTHCHECK_WARN_PP", "8")
-    monkeypatch.setenv("HEALTHCHECK_ALPHA_WARN", "0.01")
-    assert hc_alert.assess(c, None, c.new).level == "ok"  # зажадали більшої впевненості
-    monkeypatch.setenv("HEALTHCHECK_ALPHA_WARN", "0.2")
-    monkeypatch.setenv("HEALTHCHECK_CRIT_PP", "10")
-    monkeypatch.setenv("HEALTHCHECK_ALPHA_CRIT", "0.1")
-    assert hc_alert.assess(c, None, c.new).level == "critical"  # знизили поріг critical до 10 п. п.
-
-
-def test_model_failures_and_incomplete_evaluation_alert_without_any_baseline():
-    summary = cmp.summarize_scopes(rows(errors=3, n=20))  # 3 з 40 = 7,5% збоїв — ще нормально
-    assert hc_alert.assess(None, None, summary).level == "info"
-    summary = cmp.summarize_scopes(rows(errors=4, n=20))  # 10%
-    a = hc_alert.assess(None, None, summary)
-    assert (a.level, a.reasons) == ("warning", ["Модель не відповіла на 4 з 40 статей (збій чи таймаут RunPod)"])
-    summary = cmp.summarize_scopes(rows(errors=10, n=20))  # 25%
-    assert hc_alert.assess(None, None, summary).level == "critical"
-    nothing = cmp.summarize_scopes([Row("a", "fb", draft="error"), Row("b", "x", draft="refused")])
-    assert hc_alert.assess(None, None, nothing).reasons == ["Модель не дала жодного драфта на 2 статей"]
-    unjudged = cmp.summarize_scopes(rows(judged=False))
-    a = hc_alert.assess(None, None, unjudged)
-    assert a.level == "warning" and a.reasons == ["Суддя оцінив лише 0% драфтів (0 з 40): цифрам звіту не варто вірити"]
-
-
-def test_reasons_put_critical_first():
-    c = compare(rows(6, 6))
-    a = hc_alert.assess(c, None, cmp.summarize_scopes(rows(errors=4)))  # збої моделі (warning) + провал Fact safety (critical)
-    assert [f.level for f in a.findings][0] == "warning"  # знайдено першим
-    assert a.reasons[0].startswith("Fact safety") and a.reasons[-1].startswith("Модель не відповіла")  # показано останнім
-
-
-# ---------- повідомлення й доставка ----------
-
-def test_message_is_short_and_points_to_the_report():
-    a = verdict(rows(6, 6))
-    text = hc_alert.message(a, RUN, "https://notion.so/r")
-    assert text.splitlines()[0] == "🔴 Health Check hc-2: погіршення"
-    assert text.splitlines()[1].startswith("• Fact safety = ok: 100% → 70%")
-    assert text.splitlines()[-2:] == ["Модель: runpod-new:draft_grounded", "Звіт: https://notion.so/r"]
-    assert hc_alert.message(a, RUN, None).endswith("Звіт: GET /health-check/runs/hc-2/report (з сервера)")
-    many = hc_alert.Assessment("warning", [hc_alert.Finding("warning", f"причина {i}") for i in range(11)])
-    assert "• … і ще 3" in hc_alert.message(many, RUN, None) and "причина 8" not in hc_alert.message(many, RUN, None)
-
-
-@pytest.fixture
-def outbox(monkeypatch):
-    """Усі вихідні HTTP-запити алерту йдуть у список; status — що відповідає «сервер»."""
-    sent = {"requests": [], "status": 200}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        sent["requests"].append((str(request.url), json.loads(request.content)))
-        return httpx.Response(sent["status"])
-
-    real = httpx.AsyncClient
-    monkeypatch.setattr(hc_alert.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+@pytest.fixture(autouse=True)
+def _clean(monkeypatch):
+    for name in CHANNEL_VARS + ("HEALTHCHECK_THRESHOLD_PP", "HEALTHCHECK_NOISE_PP", "NOTION_HEALTHCHECK_PAGE_ID",
+                                "NOTION_HEALTHCHECK_DATABASE_ID"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(hc_alert, "_recent", {})
-    return sent
 
 
-def test_channels_follow_the_environment(monkeypatch):
-    for name in ("HEALTHCHECK_ALERT_WEBHOOK", "HEALTHCHECK_ALERT_TELEGRAM_BOT_TOKEN", "HEALTHCHECK_ALERT_TELEGRAM_CHAT_ID"):
-        monkeypatch.delenv(name, raising=False)
-    assert hc_alert.channels() == []
+def _webhook(monkeypatch):
     monkeypatch.setenv("HEALTHCHECK_ALERT_WEBHOOK", "https://hooks.example/abc")
-    monkeypatch.setenv("HEALTHCHECK_ALERT_TELEGRAM_BOT_TOKEN", "123:secret")
-    assert hc_alert.channels() == ["webhook"]  # Telegram без chat_id не вважається налаштованим
-    monkeypatch.setenv("HEALTHCHECK_ALERT_TELEGRAM_CHAT_ID", "-100")
-    assert hc_alert.channels() == ["webhook", "telegram"]
 
 
-async def test_send_reaches_every_channel_and_one_failure_does_not_stop_the_other(monkeypatch, outbox, caplog):
-    monkeypatch.setenv("HEALTHCHECK_ALERT_WEBHOOK", "https://hooks.example/abc")
-    monkeypatch.setenv("HEALTHCHECK_ALERT_TELEGRAM_BOT_TOKEN", "123:secret")
-    monkeypatch.setenv("HEALTHCHECK_ALERT_TELEGRAM_CHAT_ID", "-100")
-    assert await hc_alert.send("привіт", level="critical") == {"webhook": True, "telegram": True}
-    (url1, body1), (url2, body2) = outbox["requests"]
-    assert url1 == "https://hooks.example/abc" and body1 == {"text": "привіт", "content": "привіт", "level": "critical"}
-    assert url2 == "https://api.telegram.org/bot123:secret/sendMessage"
-    assert body2 == {"chat_id": "-100", "text": "привіт", "disable_web_page_preview": True}
-    outbox.update(status=500, requests=[])
-    with caplog.at_level(logging.WARNING):
-        assert await hc_alert.send("ще раз") == {"webhook": False, "telegram": False}
-    assert len(outbox["requests"]) == 2  # обидва канали спробувано
-    assert "webhook" in caplog.text and "HTTPStatusError" in caplog.text
-    assert "hooks.example" not in caplog.text and "123:secret" not in caplog.text  # адреса й токен у журнал не потрапляють
+def failed() -> Verdict:
+    return Verdict(FAILED, "Можна публікувати: 40% проти 50% в останньому успішному прогоні hc-1 (−10 п. п.) — впало більше "
+                           "за поріг 5 п. п.", value=0.4, base_value=0.5, base_run="hc-1",
+                   problems=["Суддя не зміг оцінити 2 драфтів"], observations=[f"спостереження {i}" for i in range(5)])
 
 
-async def test_deliver_notifies_once_per_level_and_remembers_only_what_arrived(seed_run, monkeypatch, outbox):
+# ---------- текст ----------
+
+def test_message_has_verdict_rate_model_reason_and_report():
+    base = [Row(f"a{i}", "fb", draft="ok", eval="EVALUATED", fact_safety="ok", style=4) for i in range(4)]
+    new = [Row("a0", "fb", draft="ok", eval="EVALUATED", fact_safety="not ok", tier_a=1, style=2), *base[1:]]
+    c = cmp.compare("hc-1", base, "hc-2", new)
+    text = hc_alert.message(failed(), {**RUN, "note": "змінили промпт"}, "https://notion.so/r", summary=c.new, base=c)
+    assert text.splitlines() == [
+        "❌ Health Check hc-2: модель не пройшла",
+        "Можна публікувати: 40% проти 50% в останньому успішному прогоні hc-1 (−10 п. п.) — впало більше за поріг 5 п. п.",
+        "Fact safety ok 75% · Style 4–5 75% · Style (сер.) 3,5 · драфтів 4 з 4",
+        "Статті, що змінили «можна публікувати»: −1 / +0 (список у звіті)",
+        "⚠️ Суддя не зміг оцінити 2 драфтів",
+        "• спостереження 0", "• спостереження 1", "• спостереження 2", "• … і ще 2",
+        "Модель: runpod-new:draft_grounded", "Запуск: змінили промпт", "Звіт: https://notion.so/r"]
+    passed = hc_alert.message(Verdict(PASSED, "без змін"), {**RUN, "trigger": "schedule"}, None)
+    assert passed.splitlines() == ["✅ Health Check hc-2: модель пройшла", "без змін", "Модель: runpod-new:draft_grounded",
+                                   "Запуск: за розкладом", "Звіт: GET /health-check/runs/hc-2/report (з сервера)"]
+    assert hc_alert.message(Verdict(BASELINE, "перший"), RUN, None).startswith(
+        "🔵 Health Check hc-2: перший прогін, це база для порівнянь\n")
+
+
+# ---------- доставка: одне повідомлення на вердикт ----------
+
+async def test_every_run_is_reported_once_per_verdict(seed_run, monkeypatch, outbox):
     seed_run("hc-2")
-    hc_report.save_report("hc-2", KEY, markdown="# r\n", summary={}, base_run="hc-1", baseline_run=None, level="warning",
-                          reasons=[])
-    warning = hc_alert.Assessment("warning", [hc_alert.Finding("warning", "Fact safety просів")])
-    critical = hc_alert.Assessment("critical", [hc_alert.Finding("critical", "Fact safety обвалився")])
-    ok = hc_alert.Assessment("ok")
-    monkeypatch.delenv("HEALTHCHECK_ALERT_TELEGRAM_BOT_TOKEN", raising=False)
-    monkeypatch.setenv("HEALTHCHECK_ALERT_WEBHOOK", "https://hooks.example/abc")
-
-    assert await hc_alert.deliver("hc-2", KEY, ok, RUN, None) is None and outbox["requests"] == []  # ok — мовчимо
-    outbox["status"] = 503  # канал недоступний — стан не записуємо, щоб спробувати ще раз
-    assert await hc_alert.deliver("hc-2", KEY, warning, RUN, None) == {"webhook": False}
-    assert hc_alert.sent_level("hc-2", KEY) is None
+    hc_report.save_report("hc-2", KEY, markdown="# r\n", summary={}, base_run="hc-1", baseline_run=None,
+                          verdict=Verdict(UNKNOWN, "мало оцінок"))
+    _webhook(monkeypatch)
+    outbox["status"] = 503  # канал недоступний — стан не записуємо, щоб наступна спроба надіслала ще раз
+    assert await hc_alert.deliver("hc-2", KEY, Verdict(UNKNOWN, "мало оцінок"), RUN, None) == {"webhook": False}
+    assert hc_alert.sent_verdict("hc-2", KEY) is None
     outbox["status"] = 200
-    assert await hc_alert.deliver("hc-2", KEY, warning, RUN, "https://notion.so/r") == {"webhook": True}
-    assert hc_alert.sent_level("hc-2", KEY) == "warning"
-    assert await hc_alert.deliver("hc-2", KEY, warning, RUN, None) is None  # про цей рівень уже сповістили
-    assert await hc_alert.deliver("hc-2", KEY, critical, RUN, None) == {"webhook": True}  # стало гірше — ще раз
-    assert hc_alert.sent_level("hc-2", KEY) == "critical"
-    assert await hc_alert.deliver("hc-2", KEY, warning, RUN, None) is None
-    assert await hc_alert.deliver("hc-2", KEY, critical, RUN, None, force=True) == {"webhook": True}
-    texts = [body["text"] for _, body in outbox["requests"] if body.get("level") in ("warning", "critical")]
-    assert texts[1].startswith("⚠️ Health Check hc-2: є ознаки погіршення") and texts[1].endswith("Звіт: https://notion.so/r")
-    monkeypatch.setenv("HEALTHCHECK_ALERT_MIN_LEVEL", "critical")  # попередження вимкнено
-    assert await hc_alert.deliver("hc-2", KEY, warning, RUN, None, force=True) is None
+    assert await hc_alert.deliver("hc-2", KEY, Verdict(UNKNOWN, "мало оцінок"), RUN, None) == {"webhook": True}
+    assert hc_alert.sent_verdict("hc-2", KEY) == UNKNOWN
+    assert await hc_alert.deliver("hc-2", KEY, Verdict(UNKNOWN, "мало оцінок"), RUN, None) is None  # уже сповістили
+    # дооцінили — вердикт змінився: ще одне повідомлення, і воно з новим вердиктом
+    assert await hc_alert.deliver("hc-2", KEY, Verdict(PASSED, "ок"), RUN, "https://notion.so/r") == {"webhook": True}
+    assert hc_alert.sent_verdict("hc-2", KEY) == PASSED
+    assert await hc_alert.deliver("hc-2", KEY, Verdict(PASSED, "ок"), RUN, None) is None
+    assert await hc_alert.deliver("hc-2", KEY, Verdict(PASSED, "ок"), RUN, None, force=True) == {"webhook": True}
+    bodies = [b for _, b in outbox["requests"]]
+    assert [b["verdict"] for b in bodies] == [UNKNOWN, UNKNOWN, PASSED, PASSED]
+    assert bodies[2]["text"].startswith("✅ Health Check hc-2: модель пройшла\n") and bodies[2]["report_url"] == \
+        "https://notion.so/r"
 
 
-async def test_deliver_without_channels_only_logs(seed_run, monkeypatch, outbox, caplog):
+async def test_failed_mode_keeps_quiet_about_good_runs(seed_run, monkeypatch, outbox):
     seed_run("hc-2")
-    hc_report.save_report("hc-2", KEY, markdown="# r\n", summary={}, base_run=None, baseline_run=None, level="critical",
-                          reasons=[])
-    for name in ("HEALTHCHECK_ALERT_WEBHOOK", "HEALTHCHECK_ALERT_TELEGRAM_BOT_TOKEN"):
-        monkeypatch.delenv(name, raising=False)
+    hc_report.save_report("hc-2", KEY, markdown="# r\n", summary={}, base_run=None, baseline_run=None,
+                          verdict=Verdict(PASSED, "ок"))
+    _webhook(monkeypatch)
+    monkeypatch.setenv("HEALTHCHECK_ALERT_MODE", "failed")
+    assert await hc_alert.deliver("hc-2", KEY, Verdict(PASSED, "ок"), RUN, None) is None
+    assert await hc_alert.deliver("hc-2", KEY, Verdict(BASELINE, "перший"), RUN, None) is None
+    assert await hc_alert.deliver("hc-2", KEY, failed(), RUN, None) == {"webhook": True}
+    assert len(outbox["requests"]) == 1
+
+
+async def test_without_channels_it_only_logs(seed_run, outbox, caplog):
+    seed_run("hc-2")
+    hc_report.save_report("hc-2", KEY, markdown="# r\n", summary={}, base_run=None, baseline_run=None, verdict=failed())
     with caplog.at_level(logging.WARNING):
-        sent = await hc_alert.deliver("hc-2", KEY, hc_alert.Assessment("critical", [hc_alert.Finding("critical", "біда")]),
-                                      RUN, None)
-    assert sent == {} and "біда" in caplog.text and hc_alert.sent_level("hc-2", KEY) is None and outbox["requests"] == []
+        sent = await hc_alert.deliver("hc-2", KEY, failed(), RUN, None)
+    assert sent == {} and "модель не пройшла" in caplog.text and hc_alert.sent_verdict("hc-2", KEY) is None
+    assert outbox["requests"] == []
 
 
 async def test_a_failure_of_health_check_itself_is_reported_but_not_repeated(monkeypatch, outbox):
-    monkeypatch.setenv("HEALTHCHECK_ALERT_WEBHOOK", "https://hooks.example/abc")
+    _webhook(monkeypatch)
     first = await hc_alert.notify_problem("Health Check hc-2 не завершився", "RuntimeError: RunPod 500")
     assert first == {"webhook": True}
     assert outbox["requests"][0][1]["text"] == "🔴 Health Check hc-2 не завершився\nRuntimeError: RunPod 500"
@@ -256,41 +127,6 @@ async def test_a_failure_of_health_check_itself_is_reported_but_not_repeated(mon
     assert await hc_alert.notify_problem("Health Check hc-3 не завершився") == {"webhook": True}  # інше — одразу
     monkeypatch.setattr(hc_alert, "PROBLEM_REPEAT_S", 0)
     assert await hc_alert.notify_problem("Health Check hc-2 не завершився", "RuntimeError: RunPod 500") == {"webhook": True}
-
-
-# ---------- ланцюжок ----------
-
-async def test_a_regression_is_reported_once_and_the_page_title_carries_the_level(seed_run, monkeypatch, outbox):
-    seed_run("hc-1", started_at="2026-10-01T10:00:00Z")
-    seed_run("hc-2", started_at="2026-10-08T10:00:00Z")
-    _judge("hc-1", {"a1": ("ok", 4), "a2": ("ok", 4)})
-    _judge("hc-2", {"a1": ("not ok", 2), "a2": ("not ok", 2)})
-    # на двох статтях значущості не бути: відкриваємо p-захист і MIN_PAIRS, щоб перевірити саму проводку
-    monkeypatch.setattr(hc_alert, "MIN_PAIRS", 1)
-    monkeypatch.setenv("HEALTHCHECK_ALPHA_WARN", "1")
-    monkeypatch.setenv("HEALTHCHECK_ALPHA_CRIT", "1")
-    monkeypatch.setenv("HEALTHCHECK_ALERT_WEBHOOK", "https://hooks.example/abc")
-    titles = []
-
-    async def fake_create(parent, title, blocks):
-        titles.append(title)
-        return {"url": "https://www.notion.so/r"}
-
-    monkeypatch.setenv("NOTION_HEALTHCHECK_PAGE_ID", "p" * 32)
-    monkeypatch.setattr(hc_report.notion, "create_page", fake_create)
-    md = await hc_flow.make_report("hc-2", save=True)
-    assert md and md.startswith("# Health Check · hc-2 · 2026-10-08\n\n> 🔴 **Погіршення**\n\n")
-    # 1 з 4 статей без відповіді моделі — теж критично (25%), і воно першим; далі — те, що перевірили
-    assert "- Модель не відповіла на 1 з 4 статей (збій чи таймаут RunPod)\n" in md
-    assert "- Fact safety = ok: 100% → 0% (−100 п. п., p = 0,50) відносно попереднього прогону hc-1\n" in md
-    stored = hc_report.get_report("hc-2")
-    assert stored and stored["level"] == "critical" and stored["alert_level"] == "critical" and stored["alert_at"]
-    assert titles == ["🔴 Health Check · hc-2 · 2026-10-08"]
-    assert len(outbox["requests"]) == 1 and outbox["requests"][0][1]["report_url"] == "https://www.notion.so/r"
-    await hc_flow.make_report("hc-2", save=True)  # звіт перебудовано — друге сповіщення не йде
-    assert len(outbox["requests"]) == 1
-    await hc_flow.make_report("hc-2")  # без save нічого не надсилається й не зберігається
-    assert len(outbox["requests"]) == 1
 
 
 async def test_after_run_and_failed_run_report_the_problem(monkeypatch):
@@ -321,6 +157,8 @@ async def test_after_run_and_failed_run_report_the_problem(monkeypatch):
     assert problems[-1] == (f"Health Check {run_id} не завершився", "RuntimeError: база недоступна")
 
 
+# ---------- супровід після перезапуску ----------
+
 async def test_followups_finish_what_a_restart_interrupted(seed_run, monkeypatch):
     seed_run("hc-1", started_at="2026-10-01T10:00:00Z")
     seed_run("hc-2", started_at="2026-10-08T10:00:00Z")
@@ -341,7 +179,7 @@ async def test_followups_finish_what_a_restart_interrupted(seed_run, monkeypatch
     _judge("hc-2", {"a1": ("ok", 4), "a2": ("ok", 4)})
     assert hc_flow.followup_pending("hc-2")  # оцінки є, звіту ще нема
     hc_report.save_report("hc-2", hc_eval.current_judge_key(), markdown="# r\n", summary={}, base_run=None, baseline_run=None,
-                          level="info", reasons=[])
+                          verdict=Verdict(BASELINE, "перший"))
     assert not hc_flow.followup_pending("hc-2")
     await hc_flow.resume_followups()
     assert ran == ["hc-2"]
@@ -352,25 +190,27 @@ async def test_followups_do_not_pay_again_for_drafts_the_judge_already_failed_on
     key = hc_eval.current_judge_key()
     for case in hc_eval.pending_cases("hc-1", key):  # суддя збоїв на обох драфтах
         hc_eval.save_eval(hc_eval._row(case, key, outcome="ERROR", error="ParseError: немає блоку RESULT"))
-    hc_report.save_report("hc-1", key, markdown="# r\n", summary={}, base_run=None, baseline_run=None, level="warning",
-                          reasons=[])
+    hc_report.save_report("hc-1", key, markdown="# r\n", summary={}, base_run=None, baseline_run=None,
+                          verdict=Verdict(UNKNOWN, "нічого не оцінено"))
     assert not hc_flow.followup_pending("hc-1")  # звіт є, спроби були — щогодини той самий платний цикл не запускаємо
     assert cmp.pending_evals("hc-1", key) == 2  # а для порівняння вони й надалі недооцінені
 
 
-def test_alert_test_endpoint(monkeypatch):
+def test_alert_test_endpoint_shows_why_a_channel_failed(monkeypatch):
     async def fake_send(text, **extra):
-        return {"webhook": True}
+        return {"telegram": {"ok": False, "error": "Telegram: Bad Request: chat not found (400)"}}
 
-    monkeypatch.setattr(hc_alert, "send", fake_send)
-    monkeypatch.setenv("HEALTHCHECK_ALERT_WEBHOOK", "https://hooks.example/abc")
+    monkeypatch.setattr(notify, "send_detailed", fake_send)
+    monkeypatch.setenv("HEALTHCHECK_ALERT_TELEGRAM_BOT_TOKEN", "123:secret")
+    monkeypatch.setenv("HEALTHCHECK_ALERT_TELEGRAM_CHAT_ID", "-100")
     with TestClient(app) as c:
         assert c.post("/health-check/alert-test").status_code == 401
         r = c.post("/health-check/alert-test", headers={"x-webhook-secret": "t"})
-    assert r.json() == {"channels": ["webhook"], "sent": {"webhook": True}}
+    assert r.json() == {"channels": ["telegram"], "sent": {"telegram": False},
+                        "errors": {"telegram": "Telegram: Bad Request: chat not found (400)"}}
 
 
-# ---------- наскрізно: два прогони моделі → оцінка → порівняння → звіт → алерт ----------
+# ---------- наскрізно: два прогони моделі → оцінка → вердикт → рядок у Notion → повідомлення ----------
 
 class ScriptedModel:
     """«Модель», що віддає наперед заготовлені тексти: ними керуємо, що саме погіршилось між версіями."""
@@ -392,15 +232,17 @@ def _judge_result(bad: bool) -> str:
             "CORRECTED POST\n-\n\nCOMMENT\n-\n")
 
 
-async def test_two_runs_end_to_end_a_worse_model_raises_one_alert(seed_run, outbox, monkeypatch):
-    """Справжні: Postgres, SDK Anthropic (підроблено лише мережу), весь код Health Check. Підроблені: модель драфтів,
-    відповіді судді, Notion і вебхук."""
+async def test_two_runs_end_to_end(seed_run, outbox, monkeypatch):
+    """Справжні: Postgres, SDK Anthropic (підроблено лише мережу), увесь код Health Check. Підроблені: модель драфтів,
+    відповіді судді, Notion і Telegram."""
     seed_run("hc-0", status="failed")  # лише щоб засіяти 4 еталонні статті; сам прогін не завершений і базою не стає
+    from app import pg
+
+    pg.init_db()  # sync_state: id таблиці прогонів у Notion
     for name, value in (("ANTHROPIC_API_KEY", "sk-test"), ("HEALTHCHECK_EVAL", "1"), ("NOTION_HEALTHCHECK_PAGE_ID", "p" * 32),
-                        ("HEALTHCHECK_ALERT_WEBHOOK", "https://hooks.example/abc"), ("HEALTHCHECK_ALPHA_WARN", "1"),
-                        ("HEALTHCHECK_ALPHA_CRIT", "1")):  # на 4 статтях значущості не бути — перевіряємо проводку
+                        ("HEALTHCHECK_ALERT_TELEGRAM_BOT_TOKEN", "123:secret"),
+                        ("HEALTHCHECK_ALERT_TELEGRAM_CHAT_ID", "-100")):
         monkeypatch.setenv(name, value)
-    monkeypatch.setattr(hc_alert, "MIN_PAIRS", 1)
     monkeypatch.setattr(healthcheck, "WAIT_S", 0.01)
     api_calls = []
 
@@ -418,55 +260,64 @@ async def test_two_runs_end_to_end_a_worse_model_raises_one_alert(seed_run, outb
     sdk = anthropic.Anthropic(api_key="sk-test", http_client=anthropic.DefaultHttpxClient(
         transport=httpx2.MockTransport(anthropic_handler)))
     monkeypatch.setattr(hc_eval, "get_judge", lambda model=None: hc_eval.AnthropicJudge(client=sdk, model=model))
-    pages = []
+    tables, rows = [], []
 
-    async def fake_create_page(parent, title, blocks):
-        pages.append((parent, title, len(blocks)))
-        return {"url": f"https://www.notion.so/page-{len(pages)}"}
+    async def fake_create_database(parent, title, properties):
+        tables.append(title)
+        return {"id": "db-1"}
 
-    monkeypatch.setattr(hc_report.notion, "create_page", fake_create_page)
+    async def fake_create_row(database_id, properties, body=None, extra_blocks=None):
+        rows.append(properties)
+        return {"url": f"https://www.notion.so/row-{len(rows)}"}
+
+    monkeypatch.setattr(hc_report.notion, "create_database", fake_create_database)
+    monkeypatch.setattr(hc_report.notion, "create_row", fake_create_row)
 
     good = {"a1": "Нормальний пост 1", "a2": "Нормальний пост 2", "x1": "Normal thread 1", "x2": "Normal thread 2"}
     first_model = ScriptedModel("runpod-ep:v1", good)
-    first_id, _ = healthcheck.start("manual", first_model)
+    first_id, _ = healthcheck.start("schedule", first_model)
     await healthcheck.run(first_id, first_model)
 
     first = hc_report.get_report(first_id)
-    assert first and first["level"] == "info" and first["base_run"] is None  # перший прогін — це база
-    assert len(api_calls) == 4 and outbox["requests"] == []  # чотири оцінки, жодного алерту
-    assert len(pages) == 1 and pages[0][1].startswith("ℹ️ Health Check · " + first_id)
+    assert first and first["verdict"] == BASELINE and first["base_run"] is None  # перший прогін — це база
+    assert len(api_calls) == 4 and tables == [hc_report.DB_TITLE] and len(rows) == 1
+    assert rows[0]["Вердикт"] == {"select": {"name": "🔵 База"}} and rows[0]["Можна публікувати"] == {"number": 1.0}
+    (url, body), = outbox["requests"]  # повідомлення приходить і про перший прогін
+    assert url == "https://api.telegram.org/bot123:secret/sendMessage" and body["chat_id"] == "-100"
+    assert body["text"].startswith(f"🔵 Health Check {first_id}: перший прогін, це база для порівнянь\n")
+    assert "Запуск: за розкладом" in body["text"] and body["text"].endswith("Звіт: https://www.notion.so/row-1")
 
     worse = dict(good, a2="ПОГАНИЙ пост 2", x1="ПОГАНИЙ thread 1")  # нова версія моделі зіпсувала дві статті з чотирьох
     second_model = ScriptedModel("runpod-ep:v2", worse)
-    second_id, _ = healthcheck.start("manual", second_model)
+    second_id, _ = healthcheck.start("manual", second_model, note="змінили промпт")
     await healthcheck.run(second_id, second_model)
 
     assert len(api_calls) == 6  # дві незмінені статті взято з минулого прогону — за них не платимо вдруге
     assert sorted(c.split("/")[-1] for c in api_calls[4:]) == ["a2", "x1"]
-    reused = {e["article_id"]: e["reused_from"] for e in hc_eval.list_evals(second_id)}
-    assert reused == {"a1": first_id, "a2": None, "x1": None, "x2": first_id}
     report = hc_report.get_report(second_id)
-    assert report and report["level"] == "critical" and report["base_run"] == first_id and report["alert_level"] == "critical"
+    assert report and report["verdict"] == FAILED and report["base_run"] == first_id and report["alert_verdict"] == FAILED
     md = report["markdown"]
-    assert "(у базі було `runpod-ep:v1`: модель змінилась)" in md
-    assert "| Fact safety = ok | 50% | 100% | −50 п. п. ▼ |" in md and "### Погіршилось (2)" in md
-    assert "Title a2" in md and "Title x1" in md and "Title a1" not in md.split("### Погіршилось")[1]
-    assert report["notion_url"] == "https://www.notion.so/page-2" and pages[1][1].startswith("🔴 Health Check · " + second_id)
-    (url, body), = outbox["requests"]  # рівно один алерт на весь час
-    assert url == "https://hooks.example/abc" and body["level"] == "critical" and body["run_id"] == second_id
-    assert body["text"].startswith(f"🔴 Health Check {second_id}: погіршення\n• Fact safety = ok: 100% → 50% (−50 п. п., p = ")
-    assert body["text"].endswith("Звіт: https://www.notion.so/page-2")
-    assert "sk-test" not in body["text"]
+    assert md.startswith(f"# Health Check · {second_id} · ") and "> ❌ **Модель не пройшла**" in md
+    assert "(у базі було `runpod-ep:v1`: модель змінилась)" in md and "- Причина запуску: змінили промпт" in md
+    assert "### Були «можна публікувати», стали «ні» (2)" in md and "Title a2" in md and "Title x1" in md
+    assert tables == [hc_report.DB_TITLE] and len(rows) == 2  # таблиця та сама, рядок новий
+    assert rows[1]["Вердикт"] == {"select": {"name": "❌ Не пройшла"}} and rows[1]["Різниця, п. п."] == {"number": -50.0}
+    assert rows[1]["Версія моделі"]["rich_text"][0]["text"]["content"] == "runpod-ep:v2"
+    assert len(outbox["requests"]) == 2
+    text = outbox["requests"][1][1]["text"]
+    assert text.startswith(f"❌ Health Check {second_id}: модель не пройшла\nМожна публікувати: 50% проти 100% в останньому "
+                           f"успішному прогоні {first_id} (−50 п. п.) — впало більше за поріг 5 п. п.\n")
+    assert "Запуск: змінили промпт" in text and text.endswith("Звіт: https://www.notion.so/row-2")
+    assert "sk-test" not in text and "123:secret" not in text
 
-    # ті самі дані вдруге: нічого не оцінюється заново, сторінка в Notion і алерт не дублюються
+    # ті самі дані вдруге: нічого не оцінюється заново, рядок у Notion і повідомлення не дублюються
     await hc_flow.after_run(second_id)
-    assert len(api_calls) == 6 and len(pages) == 2 and len(outbox["requests"]) == 1
+    assert len(api_calls) == 6 and len(rows) == 2 and len(outbox["requests"]) == 2
 
     with TestClient(app) as c:  # і все це видно через API
         assert c.get(f"/health-check/runs/{second_id}/report").text == md
         compare = c.get(f"/health-check/compare?run={second_id}").json()
-        evals = c.get(f"/health-check/runs/{second_id}/evals").json()
-    fact = next(d for d in compare["deltas"]["all"] if d["key"] == "fact_ok_rate")
-    assert (compare["base_run"], fact["base"], fact["new"], fact["worse"], fact["better"]) == (first_id, 1.0, 0.5, 2, 0)
-    assert [(e["article_id"], e["fact_safety"], e["style"]) for e in evals] == [
-        ("a1", "ok", 4), ("a2", "not ok", 2), ("x1", "not ok", 2), ("x2", "ok", 4)]
+        runs = c.get("/health-check/runs").json()
+    assert compare["base_run"] == first_id
+    assert [(r["run_id"], r["note"]) for r in runs[:2]] == [(second_id, "змінили промпт"), (first_id, None)]
+    assert hc_verdict.RANK[report["verdict"]] == 2

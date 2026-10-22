@@ -8,9 +8,10 @@
 Прогін (hc_runs, hc_drafts): модель пише драфт для кожної еталонної статті під її канал (fb → uk, x → en).
 Окремо від кнопок: статті не бронює (used_articles), у Notion не пише, рядок статусу не чіпає. Генерує у власному
 пулі на HEALTHCHECK_PARALLEL потоків і бере місце лише тоді, коли кнопкам лишається вільне в їхньому пулі.
-Запуск — вручну (POST /health-check з сервера, можна вказати endpoint_id і mode моделі) або за розкладом
-(HEALTHCHECK_EVERY_DAYS, напр. 7; не задано — розкладу немає). Прогін, обірваний деплоєм, стає interrupted;
-{"resume": run_id} догенеровує лише те, чого бракує (і статті зі збоєм).
+Запуск — вручну (POST /health-check з сервера, можна вказати endpoint_id і mode моделі, а в note — чому запускаємо:
+«змінили промпт»; note потрапляє у звіт, рядок Notion і повідомлення) або за розкладом (HEALTHCHECK_EVERY_DAYS, напр. 14;
+не задано — розкладу немає). Прогін, обірваний деплоєм, стає interrupted; {"resume": run_id} догенеровує лише те, чого
+бракує (і статті зі збоєм). Прогін, що впав (failed), розклад повторює через RETRY_AFTER_FAILED_S, а не через 14 днів.
 """
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from . import comms, hc_alert, hc_eval, hc_flow, hc_report, notion, pg, pipeline
+from . import comms, hc_alert, hc_calibrate, hc_eval, hc_flow, hc_report, notion, pg, pipeline
 from .llm import GroundingRefused, ModelClient, RunPodModelClient
 from .models import Article, Draft
 
@@ -38,6 +39,7 @@ PARALLEL = int(os.environ.get("HEALTHCHECK_PARALLEL", "2"))
 EVERY_DAYS = float(os.environ.get("HEALTHCHECK_EVERY_DAYS") or 0)  # 0 — без розкладу, лише вручну
 WAIT_S = 5.0  # як часто перевіряти, чи звільнилось місце від кнопок
 SCHEDULE_CHECK_S = 3600
+RETRY_AFTER_FAILED_S = 24 * 3600  # прогін упав (RunPod, мережа) — розклад пробує ще раз через добу
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS hc_articles (
@@ -53,12 +55,13 @@ CREATE TABLE IF NOT EXISTS hc_articles (
 );
 CREATE TABLE IF NOT EXISTS hc_runs (
     run_id        TEXT PRIMARY KEY,
-    trigger       TEXT NOT NULL,             -- manual | schedule
+    trigger       TEXT NOT NULL,             -- manual | schedule | retry (повтор після failed)
     model_version TEXT NOT NULL,             -- runpod-<endpoint>:<mode>
     status        TEXT NOT NULL,             -- running | done | interrupted | failed
     started_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at   TIMESTAMPTZ,
-    error         TEXT
+    error         TEXT,
+    note          TEXT                       -- чому запустили вручну («змінили промпт»): у звіт і повідомлення
 );
 CREATE TABLE IF NOT EXISTS hc_drafts (
     run_id      TEXT NOT NULL REFERENCES hc_runs(run_id),
@@ -148,8 +151,10 @@ async def build_reference_set(per_channel: int = PER_CHANNEL) -> dict[str, int]:
 def init_db() -> None:
     with pg._connect() as c:
         c.execute(SCHEMA)
+        c.execute("ALTER TABLE hc_runs ADD COLUMN IF NOT EXISTS note TEXT")  # таблиця з'явилась раніше за колонку
     hc_eval.init_db()  # оцінки й звіти посилаються на hc_runs і hc_articles, тож після них
     hc_report.init_db()
+    hc_calibrate.init_db()
     with pg._connect() as c:
         # прогін, що йшов під час деплою/перезапуску, уже ніхто не допише сам — лише {"resume": run_id}
         c.execute("UPDATE hc_runs SET status = 'interrupted', finished_at = now() WHERE status = 'running'")
@@ -170,10 +175,10 @@ def done_articles(run_id: str) -> set[str]:
             "SELECT article_id FROM hc_drafts WHERE run_id = %s AND outcome <> 'error'", (run_id,))}
 
 
-def create_run(run_id: str, trigger: str, model_version: str) -> None:
+def create_run(run_id: str, trigger: str, model_version: str, note: str | None = None) -> None:
     with pg._connect() as c:
-        c.execute("INSERT INTO hc_runs (run_id, trigger, model_version, status) VALUES (%s, %s, %s, 'running')",
-                  (run_id, trigger, model_version))
+        c.execute("INSERT INTO hc_runs (run_id, trigger, model_version, status, note) VALUES (%s, %s, %s, 'running', %s)",
+                  (run_id, trigger, model_version, note))
 
 
 def reopen_run(run_id: str) -> tuple[str, str]:
@@ -213,14 +218,14 @@ def list_runs(limit: int = 20) -> list[dict]:
     """Прогони з підсумком: скільки ok / needs_manual_review / refused / error."""
     with pg._connect() as c:
         rows = c.execute(
-            """SELECT r.run_id, r.trigger, r.model_version, r.status, r.started_at, r.finished_at, r.error,
+            """SELECT r.run_id, r.trigger, r.model_version, r.status, r.started_at, r.finished_at, r.error, r.note,
                       count(d.*) FILTER (WHERE d.outcome = 'ok'),
                       count(d.*) FILTER (WHERE d.outcome = 'needs_manual_review'),
                       count(d.*) FILTER (WHERE d.outcome = 'refused'),
                       count(d.*) FILTER (WHERE d.outcome = 'error')
                FROM hc_runs r LEFT JOIN hc_drafts d USING (run_id)
                GROUP BY r.run_id ORDER BY r.started_at DESC LIMIT %s""", (limit,)).fetchall()
-    keys = ("run_id", "trigger", "model_version", "status", "started_at", "finished_at", "error",
+    keys = ("run_id", "trigger", "model_version", "status", "started_at", "finished_at", "error", "note",
             "ok", "needs_manual_review", "refused", "error_count")
     return [dict(zip(keys, r, strict=True)) for r in rows]
 
@@ -253,8 +258,10 @@ def model_for(endpoint_id: str | None = None, mode: str | None = None) -> ModelC
     return RunPodModelClient(endpoint, api_key, mode=mode or os.environ.get("RUNPOD_MODE", "draft_grounded"))
 
 
-def start(trigger: str, model: ModelClient | None = None, resume: str | None = None) -> tuple[str, ModelClient]:
-    """Зареєструвати прогін (новий або resume) і повернути (run_id, модель); сам прогін — run()."""
+def start(trigger: str, model: ModelClient | None = None, resume: str | None = None,
+          note: str | None = None) -> tuple[str, ModelClient]:
+    """Зареєструвати прогін (новий або resume) і повернути (run_id, модель); сам прогін — run(). note — чому запустили
+    (для resume ігнорується: причина та сама, що й у першого запуску)."""
     global _current
     if _current:
         raise AlreadyRunning(_current)
@@ -267,7 +274,7 @@ def start(trigger: str, model: ModelClient | None = None, resume: str | None = N
     else:
         model = model or model_for()
         run_id = f"hc-{uuid.uuid4().hex[:10]}"
-        create_run(run_id, trigger, model.version)
+        create_run(run_id, trigger, model.version, (note or "").strip()[:500] or None)
     _current = run_id
     return run_id, model
 
@@ -318,6 +325,8 @@ async def run(run_id: str, model: ModelClient) -> None:
         log.info("health check %s готово: %s", run_id, {o: outcomes.count(o) for o in set(outcomes)})
         if hc_eval.enabled():  # оцінка → порівняння → звіт → алерт; збій тут прогін уже не ламає
             await hc_flow.after_run(run_id)
+        else:  # драфти є, а вердикту не буде — без цього прогін тихо лежав би в базі, а люди чекали б повідомлення
+            await _notify_no_judge(run_id)
     except Exception as e:
         log.exception("health check %s failed", run_id)
         finish_run(run_id, "failed", f"{type(e).__name__}: {e}"[:500])
@@ -329,11 +338,30 @@ async def run(run_id: str, model: ModelClient) -> None:
         _current = None
 
 
+async def _notify_no_judge(run_id: str) -> None:
+    try:
+        await hc_alert.notify_problem(
+            f"Health Check {run_id}: драфти готові, але вердикту не буде",
+            "Оцінювач вимкнений: на сервері немає ANTHROPIC_API_KEY (або HEALTHCHECK_EVAL=0). Додати ключ і запустити "
+            f"POST /health-check/runs/{run_id}/evaluate")
+    except Exception:
+        log.exception("health check %s: не вдалося повідомити, що оцінки не буде", run_id)
+
+
 def due(last: dict | None, now: datetime) -> str | None:
-    """Що робити розкладу: "resume" — останній прогін обірвав деплой; "new" — він старший за EVERY_DAYS; None — нічого."""
+    """Що робити розкладу: "resume" — останній прогін обірвав деплой; "new" — він старший за EVERY_DAYS; "retry" — він упав
+    (failed) понад RETRY_AFTER_FAILED_S тому. Повтор — один: якщо впав і він, чекаємо звичайні EVERY_DAYS, щоб збій RunPod
+    не палив гроші щодня. None — нічого."""
     if last and last["status"] == "interrupted":
         return "resume"
-    if last is None or (now - last["started_at"]).total_seconds() >= EVERY_DAYS * 86400:
+    if last is None:
+        return "new"
+    age = (now - last["started_at"]).total_seconds()
+    if last["status"] == "failed":
+        since = (now - (last.get("finished_at") or last["started_at"])).total_seconds()
+        if last["trigger"] != "retry" and since >= RETRY_AFTER_FAILED_S:
+            return "retry"
+    if age >= EVERY_DAYS * 86400:
         return "new"
     return None
 
@@ -345,7 +373,8 @@ async def schedule_loop() -> None:
             last = last_run()
             action = None if _current else due(last, datetime.now(timezone.utc))
             if action:
-                task = asyncio.create_task(run(*start("schedule", resume=last["run_id"] if action == "resume" and last
+                trigger = "retry" if action == "retry" else "schedule"
+                task = asyncio.create_task(run(*start(trigger, resume=last["run_id"] if action == "resume" and last
                                                       else None)))
                 _tasks.add(task)
                 task.add_done_callback(_tasks.discard)

@@ -20,7 +20,7 @@ from typing import Any
 
 from . import hc_verdict, notion, pg
 from .hc_compare import SPEC, STYLE_TARGET, Comparison
-from .hc_fmt import CHANNEL, delta_text, num, p_text, pct, run_reason, short_delta, trend, value
+from .hc_fmt import CHANNEL, delta_text, p_text, pct, run_reason, short_delta, trend, value
 
 log = logging.getLogger("hc_report")
 
@@ -143,8 +143,9 @@ def _what_got_worse(v: hc_verdict.Verdict, new: dict[str, Any], base: Comparison
     out += _articles("Були «можна публікувати», стали «ні»", base.lost, SHOWN_LOST if failed else SHOWN_GAINED)
     out += _articles("Були «ні», стали «можна публікувати»", base.gained, SHOWN_GAINED)
     out += _rising_failures(new, base) if failed else []
-    out += _articles("Інші погіршення", base.regressions, SHOWN_REGRESSIONS)
-    out += _articles("Інші покращення", base.improvements, SHOWN_IMPROVEMENTS)
+    shown = {it["article_id"] for it in base.lost + base.gained}  # ті самі статті двічі не показуємо
+    out += _articles("Інші погіршення", [r for r in base.regressions if r["article_id"] not in shown], SHOWN_REGRESSIONS)
+    out += _articles("Інші покращення", [r for r in base.improvements if r["article_id"] not in shown], SHOWN_IMPROVEMENTS)
     return out if len(out) > 2 else []
 
 

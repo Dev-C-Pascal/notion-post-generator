@@ -64,4 +64,5 @@ def run_reason(run: dict[str, Any]) -> str:
     """Чому запущено прогін: примітка того, хто запускав вручну («змінили промпт»), інакше — за розкладом чи вручну."""
     if run.get("note"):
         return str(run["note"])
-    return "за розкладом" if run.get("trigger") == "schedule" else "вручну"
+    return {"schedule": "за розкладом", "retry": "повтор за розкладом: попередній прогін упав"}.get(run.get("trigger") or "",
+                                                                                                  "вручну")

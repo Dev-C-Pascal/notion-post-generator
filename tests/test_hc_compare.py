@@ -59,7 +59,8 @@ def test_summarize_counts_and_rates():
     assert (s["n"], s["drafted"], s["refused"], s["errors"], s["flagged"], s["judged"]) == (8, 6, 1, 1, 2, 6)
     assert s["coverage"] == 1.0 and s["drafted_rate"] == 0.75 and s["refusal_rate"] == 0.125 and s["error_rate"] == 0.125
     assert s["fact_ok_rate"] == 0.5 and s["fact_ok_rate_n"] == 6
-    assert s["style_45_rate"] == pytest.approx(1 / 3) and s["publishable_rate"] == pytest.approx(1 / 3)
+    # «можна публікувати» — від усіх 8 статей: відмова й збій моделі теж «ні» (f1 і x1 — 2 з 8)
+    assert s["style_45_rate"] == pytest.approx(1 / 3) and s["publishable_rate"] == 0.25
     assert s["style_avg"] == 3.0 and s["tier_a_avg"] == pytest.approx(4 / 6) and s["tier_b_avg"] == pytest.approx(2 / 6)
     # самоперевірка моделі: з двох прапорців один справжній; з трьох фейкових драфтів прапорець мав лише один
     assert s["flag_precision"] == 0.5 and s["flag_recall"] == pytest.approx(1 / 3)
@@ -220,12 +221,13 @@ async def test_the_chain_scores_what_the_judge_has_not_seen_once_per_run(seed_ru
         return {}
 
     monkeypatch.setattr(hc_eval, "evaluate_run", fake_evaluate)
-    md = await hc_flow.make_report("hc-3", evaluate_missing=True)  # попередній hc-2, еталонний hc-1: усі без оцінок
-    assert sorted(evaluated) == ["hc-1", "hc-2", "hc-3"] and md and "Попередній (hc-2)" in md and "База (hc-1)" in md
+    # вердиктів ще нема — останнього успішного теж; еталонний hc-1 оцінюємо, hc-2 нікому не потрібен
+    md = await hc_flow.make_report("hc-3", evaluate_missing=True)
+    assert sorted(evaluated) == ["hc-1", "hc-3"] and md and "Еталон (hc-1)" in md and "Останній успішний" not in md
     await hc_flow.make_report("hc-3", evaluate_missing=True)  # усе оцінено — вдруге не платимо
-    assert len(evaluated) == 3
+    assert len(evaluated) == 2
     await hc_flow.make_report("hc-3", judge_key="чужий-суддя", evaluate_missing=True)  # чужого суддю не підміняємо
-    assert len(evaluated) == 3
+    assert len(evaluated) == 2
 
 
 def test_compare_endpoint(monkeypatch):

@@ -58,14 +58,14 @@ class FakeModel:
 
 class FakeStore:
     def __init__(self, refs: list[hc.RefArticle], done=()):
-        self.refs, self.done, self.saved, self.finished = refs, set(done), {}, []
+        self.refs, self.done, self.saved, self.finished, self.notes = refs, set(done), {}, [], []
 
     def install(self, monkeypatch):
         monkeypatch.setattr(hc, "reference_articles", lambda: self.refs)
         monkeypatch.setattr(hc, "done_articles", lambda run_id: set(self.done))
         monkeypatch.setattr(hc, "save_draft", self.save)
         monkeypatch.setattr(hc, "finish_run", lambda run_id, st, error=None: self.finished.append((run_id, st, error)))
-        monkeypatch.setattr(hc, "create_run", lambda run_id, trigger, version: None)
+        monkeypatch.setattr(hc, "create_run", self.create)
         monkeypatch.setattr(hc, "WAIT_S", 0.01)
 
         def forbidden(*a, **k):
@@ -73,6 +73,9 @@ class FakeStore:
         for mod, name in ((pg, "claim_article"), (pg, "save_draft"), (notion, "create_row"), (status, "report")):
             monkeypatch.setattr(mod, name, forbidden)
         monkeypatch.setattr(hc, "_current", None)
+
+    def create(self, run_id, trigger, version, note=None):
+        self.notes.append(note)
 
     def save(self, run_id, article_id, outcome, draft, error, duration_ms):
         self.saved[article_id] = (outcome, draft.lang if draft else None, error)
@@ -128,21 +131,57 @@ async def test_buttons_go_first(monkeypatch):
 
 
 def test_schedule_due(monkeypatch):
-    monkeypatch.setattr(hc, "EVERY_DAYS", 7)
+    monkeypatch.setattr(hc, "EVERY_DAYS", 14)
     now = datetime(2026, 10, 19, tzinfo=timezone.utc)
     assert hc.due(None, now) == "new"
-    assert hc.due({"status": "done", "started_at": now - timedelta(days=7)}, now) == "new"
-    assert hc.due({"status": "done", "started_at": now - timedelta(days=3)}, now) is None
-    assert hc.due({"status": "interrupted", "started_at": now - timedelta(days=1)}, now) == "resume"
+    assert hc.due({"status": "done", "trigger": "schedule", "started_at": now - timedelta(days=14)}, now) == "new"
+    assert hc.due({"status": "done", "trigger": "schedule", "started_at": now - timedelta(days=3)}, now) is None
+    assert hc.due({"status": "interrupted", "trigger": "schedule", "started_at": now - timedelta(days=1)}, now) == "resume"
+
+
+def test_a_failed_run_is_retried_once_after_a_day(monkeypatch):
+    monkeypatch.setattr(hc, "EVERY_DAYS", 14)
+    now = datetime(2026, 10, 19, tzinfo=timezone.utc)
+
+    def failed(hours_ago: float, trigger: str = "schedule", days_old: float = 1) -> dict:
+        return {"status": "failed", "trigger": trigger, "started_at": now - timedelta(days=days_old),
+                "finished_at": now - timedelta(hours=hours_ago)}
+
+    assert hc.due(failed(23), now) is None  # ще не минула доба
+    assert hc.due(failed(24), now) == "retry"
+    assert hc.due(failed(30, trigger="manual"), now) == "retry"  # ручний прогін теж повторюємо
+    assert hc.due(failed(30, trigger="retry"), now) is None  # повтор упав — далі звичайний ритм, а не щодня
+    assert hc.due(failed(30, trigger="retry", days_old=14), now) == "new"
+
+
+async def test_without_a_judge_the_run_says_no_verdict_will_come(monkeypatch):
+    from app import hc_alert, hc_eval
+
+    store = FakeStore(REFS[:1])
+    store.install(monkeypatch)
+    problems = []
+
+    async def fake_problem(subject, details=""):
+        problems.append((subject, details))
+        return {}
+
+    monkeypatch.setattr(hc_alert, "notify_problem", fake_problem)
+    monkeypatch.setattr(hc_eval, "enabled", lambda: False)
+    run_id, model = hc.start("manual", FakeModel(), note="  змінили промпт  ")
+    await hc.run(run_id, model)
+    assert store.notes == ["змінили промпт"] and store.finished == [(run_id, "done", None)]
+    assert problems == [(f"Health Check {run_id}: драфти готові, але вердикту не буде",
+                         "Оцінювач вимкнений: на сервері немає ANTHROPIC_API_KEY (або HEALTHCHECK_EVAL=0). Додати ключ і "
+                         f"запустити POST /health-check/runs/{run_id}/evaluate")]
 
 
 def test_api(monkeypatch):
     started = []
 
-    def fake_start(trigger, model, resume=None):
+    def fake_start(trigger, model, resume=None, note=None):
         if resume == "busy":
             raise hc.AlreadyRunning("hc-1")
-        started.append((trigger, model and model.version, resume))
+        started.append((trigger, model and model.version, resume, note))
         return "hc-new", model or FakeModel()
 
     async def fake_run(run_id, model):
@@ -157,4 +196,17 @@ def test_api(monkeypatch):
         assert c.post("/health-check", headers={"x-webhook-secret": "t"}).json()["model_version"] == \
             "runpod-test:draft_grounded"  # без параметрів — модель кнопок
         assert c.post("/health-check", json={"resume": "busy"}, headers={"x-webhook-secret": "t"}).status_code == 409
-    assert started == [("manual", "runpod-ep2:draft", None), ("manual", "runpod-test:draft_grounded", None)]
+        assert c.post("/health-check", json={"note": "змінили промпт"}, headers={"x-webhook-secret": "t"}).status_code == 202
+    assert started == [("manual", "runpod-ep2:draft", None, None), ("manual", "runpod-test:draft_grounded", None, None),
+                       ("manual", "runpod-test:draft_grounded", None, "змінили промпт")]
+
+
+def test_note_is_stored_and_listed(seed_run):
+    seed_run("hc-1", started_at="2026-10-01T10:00:00Z")
+    hc.create_run("hc-2", "manual", "runpod-ep:v2", "змінили промпт")
+    assert hc.get_run("hc-2")["note"] == "змінили промпт" and hc.get_run("hc-1")["note"] is None
+    assert [r["note"] for r in hc.list_runs()] == ["змінили промпт", None]
+    with pg._connect() as c:
+        c.execute("ALTER TABLE hc_runs DROP COLUMN note")
+    hc.init_db()  # стара таблиця без колонки — init_db її додає
+    assert hc.get_run("hc-2")["note"] is None
